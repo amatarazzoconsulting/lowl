@@ -1,0 +1,247 @@
+// test_oop.lowl - Tests structures, classes, inheritance, polymorphism
+// Expected: All OOP features work correctly
+
+// Simple structure
+struct Point:
+    x: i32
+    y: i32
+
+impl Point:
+    fn new(x: i32, y: i32) -> Point:
+        return Point{x, y}
+    
+    fn distance(&self, other: &Point) -> f64:
+        let dx = (self.x - other.x) as f64
+        let dy = (self.y - other.y) as f64
+        return sqrt(dx * dx + dy * dy)
+    
+    fn translate(&mut self, dx: i32, dy: i32):
+        self.x = self.x + dx
+        self.y = self.y + dy
+
+// Class with private fields
+class Counter:
+    private:
+        value: u64 = 0
+    
+    public:
+        fn new() -> Counter:
+            return this
+        
+        fn increment() -> u64:
+            this.value = this.value + 1
+            return this.value
+        
+        fn get() -> u64:
+            return this.value
+        
+        fn reset():
+            this.value = 0
+
+// Inheritance
+class Animal:
+    protected:
+        name: string
+    
+    public:
+        fn new(name: string) -> Animal:
+            this.name = name
+            return this
+        
+        virtual fn speak() -> string:
+            return "???"
+        
+        fn get_name() -> string:
+            return this.name
+
+class Dog extends Animal:
+    public:
+        fn new(name: string) -> Dog:
+            super.new(name)
+            return this
+        
+        override fn speak() -> string:
+            return "Woof!"
+        
+        fn fetch() -> string:
+            return "Fetching the stick!"
+
+class Cat extends Animal:
+    public:
+        fn new(name: string) -> Cat:
+            super.new(name)
+            return this
+        
+        override fn speak() -> string:
+            return "Meow!"
+
+// Abstract class
+abstract class Shape:
+    public:
+        virtual fn area() -> f64
+        virtual fn perimeter() -> f64
+
+class Rectangle extends Shape:
+    private:
+        width: f64
+        height: f64
+    
+    public:
+        fn new(w: f64, h: f64) -> Rectangle:
+            this.width = w
+            this.height = h
+            return this
+        
+        override fn area() -> f64:
+            return this.width * this.height
+        
+        override fn perimeter() -> f64:
+            return 2.0 * (this.width + this.height)
+
+class Circle extends Shape:
+    private:
+        radius: f64
+    
+    public:
+        fn new(r: f64) -> Circle:
+            this.radius = r
+            return this
+        
+        override fn area() -> f64:
+            return 3.141592653589793 * this.radius * this.radius
+        
+        override fn perimeter() -> f64:
+            return 2.0 * 3.141592653589793 * this.radius
+
+fn main() -> u32:
+    print_string("=== OOP Test ===\n\n")
+    let mut passed: u64 = 0
+    let mut failed: u64 = 0
+    
+    // Test 1: Structure
+    print_string("Test 1: Structure... ")
+    let p1 = Point.new(0, 0)
+    let p2 = Point.new(3, 4)
+    let dist = p1.distance(&p2)
+    
+    if dist - 5.0 < 0.01:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 2: Mutable structure
+    print_string("Test 2: Mutable structure... ")
+    let mut p3 = Point.new(10, 20)
+    p3.translate(5, -5)
+    
+    if p3.x == 15 and p3.y == 15:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 3: Class with private fields
+    print_string("Test 3: Class... ")
+    let mut c = Counter.new()
+    c.increment()
+    c.increment()
+    let val = c.get()
+    c.reset()
+    let val2 = c.get()
+    
+    if val == 2 and val2 == 0:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 4: Inheritance
+    print_string("Test 4: Inheritance... ")
+    let dog = Dog.new("Rex")
+    let cat = Cat.new("Whiskers")
+    
+    if dog.get_name() == "Rex" and cat.get_name() == "Whiskers":
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 5: Polymorphism
+    print_string("Test 5: Polymorphism... ")
+    let animals: array<ptr<Animal>, 2> = [&dog, &cat]
+    let sounds = [animals[0].speak(), animals[1].speak()]
+    
+    if sounds[0] == "Woof!" and sounds[1] == "Meow!":
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 6: Abstract class
+    print_string("Test 6: Abstract class... ")
+    let rect = Rectangle.new(10.0, 20.0)
+    let circle = Circle.new(5.0)
+    
+    if rect.area() == 200.0 and (circle.area() - 78.5398) < 0.01:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Summary
+    print_string("\n=== Test Summary ===\n")
+    print_string("Passed: ")
+    print_dec(passed)
+    print_string("\nFailed: ")
+    print_dec(failed)
+    print_string("\n")
+    
+    if failed == 0:
+        print_string("ALL OOP TESTS PASSED!\n")
+        return 0
+    else:
+        print_string("SOME TESTS FAILED!\n")
+        return 1
+
+// Helper functions
+static vga: mmio_ptr<u16> = 0xB8000 as mmio_ptr<u16>
+static cursor: u64 = 0
+
+fn print_char(ch: u8):
+    let color = (0x0F << 8) as u16
+    if ch == '\n' as u8:
+        cursor = cursor + (80 - (cursor % 80))
+    else:
+        vga[cursor] = color | (ch as u16)
+        cursor = cursor + 1
+    if cursor >= 80 * 25:
+        cursor = 0
+
+fn print_string(s: string):
+    for ch in s:
+        print_char(ch as u8)
+
+fn print_dec(value: u64):
+    if value == 0:
+        print_char('0')
+        return
+    let mut temp = value
+    let mut digits: array<u8, 20>
+    let mut i: u64 = 0
+    while temp > 0:
+        digits[i] = (temp % 10) as u8
+        temp = temp / 10
+        i = i + 1
+    for j in i..0 step -1:
+        print_char('0' + digits[j - 1])
+
+fn sqrt(x: f64) -> f64:
+    // Simple implementation (for test)
+    return x ** 0.5
