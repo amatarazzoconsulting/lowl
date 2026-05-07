@@ -1,0 +1,135 @@
+// test_basic.lowl - Tests basic syntax, variables, and types
+// Expected: Compiles successfully, prints all test results
+
+fn main() -> u32:
+    print_string("=== Basic Syntax Test ===\n\n")
+    let mut passed: u64 = 0
+    let mut failed: u64 = 0
+    
+    // Test 1: Variable declarations
+    print_string("Test 1: Variable declarations... ")
+    let a: u8 = 255
+    let b: i8 = -128
+    let c: u16 = 65535
+    let d: i16 = -32768
+    let e: u32 = 4294967295
+    let f: i32 = -2147483648
+    let g: u64 = 18446744073709551615
+    let h: i64 = -9223372036854775808
+    let pi: f32 = 3.14159
+    let tau: f64 = 6.28318
+    let flag: bool = true
+    let letter: char = 'A'
+    
+    if a == 255 and b == -128 and c == 65535 and d == -32768:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 2: Type inference
+    print_string("Test 2: Type inference... ")
+    let x = 42
+    let y = 3.14
+    let z = true
+    let name = "lowl"
+    
+    if x == 42 and y > 3.0 and z and name == "lowl":
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 3: Constants
+    print_string("Test 3: Constants... ")
+    const MAX_SIZE = 4096
+    const PI_VAL = 3.141592653589793
+    const HELLO = "Hello"
+    
+    if MAX_SIZE == 4096 and PI_VAL > 3.14 and HELLO == "Hello":
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 4: Arrays
+    print_string("Test 4: Arrays... ")
+    let arr1: array<u64, 5> = [1, 2, 3, 4, 5]
+    let arr2 = [10, 20, 30]
+    let matrix: array<array<u64, 3>, 3> = [
+        [1, 2, 3],
+        [4, 5, 6],
+        [7, 8, 9]
+    ]
+    
+    if arr1[2] == 3 and arr2[1] == 20 and matrix[1][1] == 5:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 5: Pointers
+    print_string("Test 5: Pointers... ")
+    let value: u64 = 100
+    let ptr_val: ptr<u64> = &value
+    let mut mut_val: u64 = 200
+    let mut_ptr: ptr_mut<u64> = &mut mut_val
+    
+    if *ptr_val == 100:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Summary
+    print_string("\n=== Test Summary ===\n")
+    print_string("Passed: ")
+    print_dec(passed)
+    print_string("\nFailed: ")
+    print_dec(failed)
+    print_string("\n")
+    
+    if failed == 0:
+        print_string("ALL BASIC TESTS PASSED!\n")
+        return 0
+    else:
+        print_string("SOME TESTS FAILED!\n")
+        return 1
+
+// Helper functions
+static vga: mmio_ptr<u16> = 0xB8000 as mmio_ptr<u16>
+static cursor: u64 = 0
+
+fn print_char(ch: u8):
+    let color = (0x0F << 8) as u16
+    if ch == '\n' as u8:
+        cursor = cursor + (80 - (cursor % 80))
+    else:
+        vga[cursor] = color | (ch as u16)
+        cursor = cursor + 1
+    if cursor >= 80 * 25:
+        cursor = 0
+
+fn print_string(s: string):
+    for ch in s:
+        print_char(ch as u8)
+
+fn print_dec(value: u64):
+    if value == 0:
+        print_char('0')
+        return
+    let mut temp = value
+    let mut digits: array<u8, 20>
+    let mut i: u64 = 0
+    while temp > 0:
+        digits[i] = (temp % 10) as u8
+        temp = temp / 10
+        i = i + 1
+    for j in i..0 step -1:
+        print_char('0' + digits[j - 1])
+
