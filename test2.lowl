@@ -1,0 +1,186 @@
+// test_control.lowl - Tests if, while, for, switch statements
+// Expected: All control flow constructs work correctly
+
+fn main() -> u32:
+    print_string("=== Control Flow Test ===\n\n")
+    let mut passed: u64 = 0
+    let mut failed: u64 = 0
+    
+    // Test 1: If-elif-else
+    print_string("Test 1: If-elif-else... ")
+    let x: i64 = 42
+    let mut result: i64 = 0
+    
+    if x < 0:
+        result = -1
+    elif x == 0:
+        result = 0
+    elif x > 0 and x < 100:
+        result = 1
+    else:
+        result = 2
+    
+    if result == 1:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 2: While loop
+    print_string("Test 2: While loop... ")
+    let mut i: u64 = 0
+    let mut sum: u64 = 0
+    while i < 10:
+        sum = sum + i
+        i = i + 1
+    
+    if sum == 45:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 3: For loop (traditional)
+    print_string("Test 3: For loop traditional... ")
+    let mut sum2: u64 = 0
+    for (let j = 0; j < 10; j = j + 1):
+        sum2 = sum2 + j
+    
+    if sum2 == 45:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 4: For range loop
+    print_string("Test 4: For range... ")
+    let mut sum3: u64 = 0
+    for k in 0..10:
+        sum3 = sum3 + k
+    
+    if sum3 == 45:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 5: For range with step
+    print_string("Test 5: For range step... ")
+    let mut sum4: u64 = 0
+    for m in 0..10 step 2:
+        sum4 = sum4 + m
+    
+    if sum4 == 20:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 6: Break and continue
+    print_string("Test 6: Break and continue... ")
+    let mut n: u64 = 0
+    let mut count: u64 = 0
+    while n < 20:
+        n = n + 1
+        if n % 2 == 0:
+            continue
+        count = count + 1
+        if count >= 5:
+            break
+    
+    if count == 5 and n == 9:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 7: Switch with literals
+    print_string("Test 7: Switch literals... ")
+    let day: u64 = 3
+    let mut day_name: string = ""
+    switch (day):
+        case 1: day_name = "Monday"
+        case 2: day_name = "Tuesday"
+        case 3: day_name = "Wednesday"
+        case 4: day_name = "Thursday"
+        case 5: day_name = "Friday"
+        default: day_name = "Weekend"
+    
+    if day_name == "Wednesday":
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 8: Switch with guard (when)
+    print_string("Test 8: Switch guard... ")
+    let score: i64 = 85
+    let mut grade: string = ""
+    switch (score):
+        case when (score >= 90): grade = "A"
+        case when (score >= 80): grade = "B"
+        case when (score >= 70): grade = "C"
+        case when (score >= 60): grade = "D"
+        default: grade = "F"
+    
+    if grade == "B":
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Summary
+    print_string("\n=== Test Summary ===\n")
+    print_string("Passed: ")
+    print_dec(passed)
+    print_string("\nFailed: ")
+    print_dec(failed)
+    print_string("\n")
+    
+    if failed == 0:
+        print_string("ALL CONTROL FLOW TESTS PASSED!\n")
+        return 0
+    else:
+        print_string("SOME TESTS FAILED!\n")
+        return 1
+
+// Helper functions (same as test_basic)
+static vga: mmio_ptr<u16> = 0xB8000 as mmio_ptr<u16>
+static cursor: u64 = 0
+
+fn print_char(ch: u8):
+    let color = (0x0F << 8) as u16
+    if ch == '\n' as u8:
+        cursor = cursor + (80 - (cursor % 80))
+    else:
+        vga[cursor] = color | (ch as u16)
+        cursor = cursor + 1
+    if cursor >= 80 * 25:
+        cursor = 0
+
+fn print_string(s: string):
+    for ch in s:
+        print_char(ch as u8)
+
+fn print_dec(value: u64):
+    if value == 0:
+        print_char('0')
+        return
+    let mut temp = value
+    let mut digits: array<u8, 20>
+    let mut i: u64 = 0
+    while temp > 0:
+        digits[i] = (temp % 10) as u8
+        temp = temp / 10
+        i = i + 1
+    for j in i..0 step -1:
+        print_char('0' + digits[j - 1])
+
