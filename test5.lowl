@@ -1,0 +1,183 @@
+// test_conversion.lowl - Tests type conversion with rounding
+// Expected: All conversion methods work correctly
+
+fn main() -> u32:
+    print_string("=== Type Conversion Test ===\n\n")
+    let mut passed: u64 = 0
+    let mut failed: u64 = 0
+    
+    // Test 1: Lossless conversion
+    print_string("Test 1: Lossless conversion... ")
+    let x: u32 = 42
+    let y: u64 = x:u64
+    let z: i64 = x:i64
+    
+    if y == 42 and z == 42:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 2: Rounding (nearest)
+    print_string("Test 2: Rounding (nearest)... ")
+    let pi: f64 = 3.14159
+    let rounded = pi:u64.round()
+    let neg_pi: f64 = -3.14159
+    let neg_rounded = neg_pi:i64.round()
+    
+    if rounded == 3 and neg_rounded == -3:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 3: Floor and Ceiling
+    print_string("Test 3: Floor and Ceiling... ")
+    let val: f64 = 3.7
+    let floor_val = val:u64.floor()
+    let ceil_val = val:u64.ceil()
+    
+    if floor_val == 3 and ceil_val == 4:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 4: Truncation
+    print_string("Test 4: Truncation... ")
+    let pos = 3.7:u64.trunc()
+    let neg = -3.7:i64.trunc()
+    
+    if pos == 3 and neg == -3:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 5: Tie-breaking (even vs away)
+    print_string("Test 5: Tie-breaking... ")
+    let half: f64 = 2.5
+    let tie_even = half:u32.nearest_tie_even()
+    let tie_away = half:u32.nearest_tie_away()
+    
+    if tie_even == 2 and tie_away == 3:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 6: Saturating conversion
+    print_string("Test 6: Saturating conversion... ")
+    let large: u64 = 300
+    let small_sat: u8 = large:u8.saturating()
+    let negative: i64 = -50
+    let unsigned_sat: u8 = negative:u8.saturating()
+    
+    if small_sat == 255 and unsigned_sat == 0:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 7: Wrapping conversion
+    print_string("Test 7: Wrapping conversion... ")
+    let large_wrap: u8 = 300:u8.wrapping()
+    let negative_wrap: u8 = (-50):u8.wrapping()
+    
+    if large_wrap == 44 and negative_wrap == 206:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 8: Checked conversion
+    print_string("Test 8: Checked conversion... ")
+    let val1 = 100:u8.checked()
+    let val2 = 300:u8.checked()
+    
+    if val1.is_some() and val2.is_none():
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 9: Pointer to integer
+    print_string("Test 9: Pointer conversion... ")
+    let buffer: array<u8, 10> = [0; 10]
+    let ptr_val = &buffer[0] as ptr<u8>
+    let addr = ptr_val:u64
+    
+    if addr != 0:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 10: Integer to pointer
+    print_string("Test 10: Integer to pointer... ")
+    let mmio_addr: u64 = 0xB8000
+    let mmio_ptr = mmio_addr:mmio_ptr<u16>
+    
+    if mmio_ptr != null:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Summary
+    print_string("\n=== Test Summary ===\n")
+    print_string("Passed: ")
+    print_dec(passed)
+    print_string("\nFailed: ")
+    print_dec(failed)
+    print_string("\n")
+    
+    if failed == 0:
+        print_string("ALL CONVERSION TESTS PASSED!\n")
+        return 0
+    else:
+        print_string("SOME TESTS FAILED!\n")
+        return 1
+
+// Helper functions (standard VGA output)
+static vga: mmio_ptr<u16> = 0xB8000 as mmio_ptr<u16>
+static cursor: u64 = 0
+
+fn print_char(ch: u8):
+    let color = (0x0F << 8) as u16
+    if ch == '\n' as u8:
+        cursor = cursor + (80 - (cursor % 80))
+    else:
+        vga[cursor] = color | (ch as u16)
+        cursor = cursor + 1
+    if cursor >= 80 * 25:
+        cursor = 0
+
+fn print_string(s: string):
+    for ch in s:
+        print_char(ch as u8)
+
+fn print_dec(value: u64):
+    if value == 0:
+        print_char('0')
+        return
+    let mut temp = value
+    let mut digits: array<u8, 20>
+    let mut i: u64 = 0
+    while temp > 0:
+        digits[i] = (temp % 10) as u8
+        temp = temp / 10
+        i = i + 1
+    for j in i..0 step -1:
+        print_char('0' + digits[j - 1])
+
