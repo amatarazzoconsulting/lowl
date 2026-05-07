@@ -1,0 +1,186 @@
+// test_templates.lowl - Tests templates and generics
+// Expected: All template features work correctly
+
+// Template class
+template<class T>
+class Stack:
+    private:
+        data: array<T, 100>
+        top: u64 = 0
+    
+    public:
+        fn push(item: T):
+            if this.top < 100:
+                this.data[this.top] = item
+                this.top = this.top + 1
+        
+        fn pop() -> Option<T>:
+            if this.top > 0:
+                this.top = this.top - 1
+                return Option.some(this.data[this.top])
+            return Option.none()
+        
+        fn peek() -> Option<T>:
+            if this.top > 0:
+                return Option.some(this.data[this.top - 1])
+            return Option.none()
+        
+        fn is_empty() -> bool:
+            return this.top == 0
+        
+        fn size() -> u64:
+            return this.top
+
+// Template function
+template<class T>
+fn max(a: T, b: T) -> T:
+    if a > b:
+        return a
+    else:
+        return b
+
+// Template specialization
+template<>
+fn max(a: string, b: string) -> string:
+    if a.len() > b.len():
+        return a
+    else:
+        return b
+
+// Multiple template parameters
+template<class K, class V>
+class Pair:
+    key: K
+    value: V
+
+impl<K, V> Pair<K, V>:
+    fn new(k: K, v: V) -> Pair<K, V>:
+        return Pair{k, v}
+    
+    fn get_key() -> K:
+        return this.key
+    
+    fn get_value() -> V:
+        return this.value
+
+fn main() -> u32:
+    print_string("=== Templates Test ===\n\n")
+    let mut passed: u64 = 0
+    let mut failed: u64 = 0
+    
+    // Test 1: Template class with integers
+    print_string("Test 1: Stack<u64>... ")
+    let mut int_stack = Stack<u64>.new()
+    int_stack.push(10)
+    int_stack.push(20)
+    int_stack.push(30)
+    
+    let v1 = int_stack.pop()
+    let v2 = int_stack.pop()
+    let v3 = int_stack.pop()
+    let empty = int_stack.pop()
+    
+    if v1.unwrap() == 30 and v2.unwrap() == 20 and v3.unwrap() == 10 and empty.is_none():
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 2: Template class with strings
+    print_string("Test 2: Stack<string>... ")
+    let mut str_stack = Stack<string>.new()
+    str_stack.push("Hello")
+    str_stack.push("World")
+    
+    let s1 = str_stack.pop()
+    let s2 = str_stack.pop()
+    
+    if s1.unwrap() == "World" and s2.unwrap() == "Hello":
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 3: Template function
+    print_string("Test 3: max function... ")
+    let int_max = max(10, 20)
+    let float_max = max(3.14, 2.71)
+    
+    if int_max == 20 and (float_max - 3.14) < 0.01:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 4: Template specialization
+    print_string("Test 4: max specialization... ")
+    let str_max = max("short", "verylongstring")
+    
+    if str_max == "verylongstring":
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 5: Multiple template parameters
+    print_string("Test 5: Pair<K,V>... ")
+    let p = Pair<u64, string>.new(42, "answer")
+    
+    if p.get_key() == 42 and p.get_value() == "answer":
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Summary
+    print_string("\n=== Test Summary ===\n")
+    print_string("Passed: ")
+    print_dec(passed)
+    print_string("\nFailed: ")
+    print_dec(failed)
+    print_string("\n")
+    
+    if failed == 0:
+        print_string("ALL TEMPLATE TESTS PASSED!\n")
+        return 0
+    else:
+        print_string("SOME TESTS FAILED!\n")
+        return 1
+
+// Helper functions
+static vga: mmio_ptr<u16> = 0xB8000 as mmio_ptr<u16>
+static cursor: u64 = 0
+
+fn print_char(ch: u8):
+    let color = (0x0F << 8) as u16
+    if ch == '\n' as u8:
+        cursor = cursor + (80 - (cursor % 80))
+    else:
+        vga[cursor] = color | (ch as u16)
+        cursor = cursor + 1
+    if cursor >= 80 * 25:
+        cursor = 0
+
+fn print_string(s: string):
+    for ch in s:
+        print_char(ch as u8)
+
+fn print_dec(value: u64):
+    if value == 0:
+        print_char('0')
+        return
+    let mut temp = value
+    let mut digits: array<u8, 20>
+    let mut i: u64 = 0
+    while temp > 0:
+        digits[i] = (temp % 10) as u8
+        temp = temp / 10
+        i = i + 1
+    for j in i..0 step -1:
+        print_char('0' + digits[j - 1])
+
