@@ -1,0 +1,136 @@
+// test_simd.lowl - Tests SIMD vector operations
+// Expected: All SIMD operations compile and produce correct results
+
+fn main() -> u32:
+    print_string("=== SIMD Vector Test ===\n\n")
+    let mut passed: u64 = 0
+    let mut failed: u64 = 0
+    
+    // Test 1: SSE vector (4 floats)
+    print_string("Test 1: SSE vector (vec4_f32)... ")
+    let a = vec4_f32(1.0, 2.0, 3.0, 4.0)
+    let b = vec4_f32(5.0, 6.0, 7.0, 8.0)
+    let sum = a + b
+    let prod = a * b
+    
+    if sum[0] == 6.0 and sum[1] == 8.0 and sum[2] == 10.0 and sum[3] == 12.0:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 2: AVX vector (8 floats)
+    print_string("Test 2: AVX vector (vec8_f32)... ")
+    let c = vec8_f32(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0)
+    let d = vec8_f32(8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0)
+    let diff = c - d
+    let quot = c / d
+    
+    if diff[0] == -7.0 and diff[7] == 7.0:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 3: AVX-512 vector (16 floats)
+    print_string("Test 3: AVX-512 vector (vec16_f32)... ")
+    let mut e = vec16_f32.iota(0.0, 1.0)
+    let f = vec16_f32.broadcast(2.0)
+    let multiplied = e * f
+    
+    if multiplied[0] == 0.0 and multiplied[15] == 30.0:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 4: Double precision vectors
+    print_string("Test 4: Double precision (vec4_f64)... ")
+    let g = vec4_f64(1.0, 2.0, 3.0, 4.0)
+    let h = vec4_f64(4.0, 3.0, 2.0, 1.0)
+    let dot = g.dot(&h)
+    
+    if dot == 20.0:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 5: Horizontal operations
+    print_string("Test 5: Horizontal operations... ")
+    let i = vec8_f32(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0)
+    let sum_all = i.hadd_all()
+    let max_all = i.hmax()
+    let min_all = i.hmin()
+    
+    if sum_all == 36.0 and max_all == 8.0 and min_all == 1.0:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 6: Fused multiply-add
+    print_string("Test 6: Fused multiply-add... ")
+    let j = vec8_f32(2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0)
+    let k = vec8_f32(3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0)
+    let l = vec8_f32(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    let fma_result = j.fma(&k, &l)
+    
+    if fma_result[0] == 7.0 and fma_result[7] == 7.0:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Summary
+    print_string("\n=== Test Summary ===\n")
+    print_string("Passed: ")
+    print_dec(passed)
+    print_string("\nFailed: ")
+    print_dec(failed)
+    print_string("\n")
+    
+    if failed == 0:
+        print_string("ALL SIMD TESTS PASSED!\n")
+        return 0
+    else:
+        print_string("SOME TESTS FAILED!\n")
+        return 1
+
+// Helper functions
+static vga: mmio_ptr<u16> = 0xB8000 as mmio_ptr<u16>
+static cursor: u64 = 0
+
+fn print_char(ch: u8):
+    let color = (0x0F << 8) as u16
+    if ch == '\n' as u8:
+        cursor = cursor + (80 - (cursor % 80))
+    else:
+        vga[cursor] = color | (ch as u16)
+        cursor = cursor + 1
+    if cursor >= 80 * 25:
+        cursor = 0
+
+fn print_string(s: string):
+    for ch in s:
+        print_char(ch as u8)
+
+fn print_dec(value: u64):
+    if value == 0:
+        print_char('0')
+        return
+    let mut temp = value
+    let mut digits: array<u8, 20>
+    let mut i: u64 = 0
+    while temp > 0:
+        digits[i] = (temp % 10) as u8
+        temp = temp / 10
+        i = i + 1
+    for j in i..0 step -1:
+        print_char('0' + digits[j - 1])
