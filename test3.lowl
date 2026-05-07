@@ -1,0 +1,187 @@
+// test_functions.lowl - Tests function declarations, overloading, recursion
+// Expected: All function features work correctly
+
+// Basic function
+fn add(a: u64, b: u64) -> u64:
+    return a + b
+
+// Overloaded function (different parameter types)
+fn add(a: f64, b: f64) -> f64:
+    return a + b
+
+// Overloaded function (different parameter count)
+fn add(a: u64, b: u64, c: u64) -> u64:
+    return a + b + c
+
+// Function with default parameters
+fn greet(name: string = "World") -> string:
+    return "Hello, " + name + "!"
+
+// Inline function
+inline fn square(x: u64) -> u64:
+    return x * x
+
+// Recursive function
+fn factorial(n: u64) -> u64:
+    if n <= 1:
+        return 1
+    return n * factorial(n - 1)
+
+// Tail-recursive function
+fn factorial_tail(n: u64, acc: u64) -> u64:
+    if n <= 1:
+        return acc
+    return factorial_tail(n - 1, n * acc)
+
+// Function returning multiple values (via tuple)
+fn divide_with_remainder(a: u64, b: u64) -> (u64, u64):
+    return (a / b, a % b)
+
+// Function as parameter (higher-order)
+fn apply_twice(f: fn(u64) -> u64, x: u64) -> u64:
+    return f(f(x))
+
+fn main() -> u32:
+    print_string("=== Functions Test ===\n\n")
+    let mut passed: u64 = 0
+    let mut failed: u64 = 0
+    
+    // Test 1: Basic function call
+    print_string("Test 1: Basic function... ")
+    let result1 = add(10, 20)
+    if result1 == 30:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 2: Function overloading (type)
+    print_string("Test 2: Overloading by type... ")
+    let result2 = add(3.14, 2.86)
+    if result2 - 6.0 < 0.01:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 3: Function overloading (count)
+    print_string("Test 3: Overloading by count... ")
+    let result3 = add(10, 20, 30)
+    if result3 == 60:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 4: Default parameters
+    print_string("Test 4: Default parameters... ")
+    let greeting1 = greet()
+    let greeting2 = greet("lowl")
+    if greeting1 == "Hello, World!" and greeting2 == "Hello, lowl!":
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 5: Inline function
+    print_string("Test 5: Inline function... ")
+    let sq = square(12)
+    if sq == 144:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 6: Recursion
+    print_string("Test 6: Recursion... ")
+    let fact5 = factorial(5)
+    if fact5 == 120:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 7: Tail recursion
+    print_string("Test 7: Tail recursion... ")
+    let fact5_tail = factorial_tail(5, 1)
+    if fact5_tail == 120:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 8: Multiple return values
+    print_string("Test 8: Multiple returns... ")
+    let (quot, rem) = divide_with_remainder(17, 5)
+    if quot == 3 and rem == 2:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Test 9: Higher-order function
+    print_string("Test 9: Higher-order function... ")
+    let double = fn(x: u64) -> u64: return x * 2
+    let result4 = apply_twice(double, 5)
+    if result4 == 20:
+        passed = passed + 1
+        print_string("PASSED\n")
+    else:
+        failed = failed + 1
+        print_string("FAILED\n")
+    
+    // Summary
+    print_string("\n=== Test Summary ===\n")
+    print_string("Passed: ")
+    print_dec(passed)
+    print_string("\nFailed: ")
+    print_dec(failed)
+    print_string("\n")
+    
+    if failed == 0:
+        print_string("ALL FUNCTION TESTS PASSED!\n")
+        return 0
+    else:
+        print_string("SOME TESTS FAILED!\n")
+        return 1
+
+// Helper functions (standard VGA output)
+static vga: mmio_ptr<u16> = 0xB8000 as mmio_ptr<u16>
+static cursor: u64 = 0
+
+fn print_char(ch: u8):
+    let color = (0x0F << 8) as u16
+    if ch == '\n' as u8:
+        cursor = cursor + (80 - (cursor % 80))
+    else:
+        vga[cursor] = color | (ch as u16)
+        cursor = cursor + 1
+    if cursor >= 80 * 25:
+        cursor = 0
+
+fn print_string(s: string):
+    for ch in s:
+        print_char(ch as u8)
+
+fn print_dec(value: u64):
+    if value == 0:
+        print_char('0')
+        return
+    let mut temp = value
+    let mut digits: array<u8, 20>
+    let mut i: u64 = 0
+    while temp > 0:
+        digits[i] = (temp % 10) as u8
+        temp = temp / 10
+        i = i + 1
+    for j in i..0 step -1:
+        print_char('0' + digits[j - 1])
+
