@@ -1,35 +1,19 @@
-I have a book and a compiler written in python. Please ensure that the compiler has all the features of described in the books. One option I noticed is asm inlined
-
 LOWL System Language Static Compiler
-
-
-
 By Anthony Matarazzo (c) 2026
 
 
-
 LOWL Language Reference Manual v2.1.0
-
 A Comprehensive Systems Programming Language for Intel x86_64
-
-Copyright (c) 2026 Anthony Matarazzo
 
 MIT License
 
-
 Table of Contents
-
 Volume I: Foundations
-
-Introduction to lowl
-
-The Intel x86_64 Architecture and Protected Mode
-
-Booting and System Initialization
-
-Language Fundamentals
-
-Type System
+1. Introduction to lowl
+2. he Intel x86_64 Architecture and Protected Mode
+3. Booting and System Initialization
+4. Language Fundamentals
+5. Type System
 
 Volume II: Core Language Features
 6. Type Conversion with Rounding Control
@@ -52,9 +36,7 @@ Volume IV: Systems Programming
 19. Compiler Directives and Optimization
 20. Complete Examples and Appendix
 
-
 Volume I: Foundations
-
 
 Chapter 1: Introduction to lowl
 
