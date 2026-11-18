@@ -659,12 +659,30 @@ class Lexer:
         while self.current() != delim and self.current() != '\0':
             if self.current() == '\\':
                 self.advance()
-                if self.current() == 'n': s += '\n'
-                elif self.current() == 't': s += '\t'
-                elif self.current() == '\\': s += '\\'
-                elif self.current() == '"': s += '"'
-                elif self.current() == "'": s += "'"
-                else: s += self.current()
+                esc = self.current()
+                if esc == 'n': s += '\n'
+                elif esc == 'r': s += '\r'
+                elif esc == 't': s += '\t'
+                elif esc == '0': s += '\0'
+                elif esc == 'a': s += '\a'
+                elif esc == 'b': s += '\b'
+                elif esc == 'f': s += '\f'
+                elif esc == 'v': s += '\v'
+                elif esc == '\\': s += '\\'
+                elif esc == '"': s += '"'
+                elif esc == "'": s += "'"
+                elif esc == 'x':
+                    self.advance()          # move past the 'x'
+                    digits = ''
+                    for _ in range(2):
+                        if self.current().lower() in '0123456789abcdef':
+                            digits += self.current()
+                            self.advance()
+                        else:
+                            break
+                    s += chr(int(digits, 16)) if digits else 'x'
+                    continue
+                else: s += esc
             else:
                 s += self.current()
             self.advance()
@@ -2519,8 +2537,14 @@ class Parser:
 
         if tok.type in (TokenType.TOK_NUMBER, TokenType.TOK_HEX, TokenType.TOK_BINARY):
             self.advance()
-            node = ASTNode(ASTType.LITERAL, tok.value, tok.line, tok.column)
-            if '.' in tok.value or 'e' in tok.value.lower():
+            if tok.type == TokenType.TOK_HEX:
+                literal = str(int(tok.value or '0', 16))
+            elif tok.type == TokenType.TOK_BINARY:
+                literal = str(int(tok.value or '0', 2))
+            else:
+                literal = tok.value
+            node = ASTNode(ASTType.LITERAL, literal, tok.line, tok.column)
+            if '.' in literal or 'e' in literal.lower():
                 node.data_type = DataType.F64
             else:
                 node.data_type = DataType.U64
@@ -4654,6 +4678,716 @@ class CodeGenerator:
 
         self.emit("push rax", "text")
 
+def literal_int(node) -> int:
+    """Integer value of a numeric literal, honouring the base it was written in."""
+    raw = node.value
+    if isinstance(raw, int):
+        return raw
+    text = str(raw).strip()
+    base = node.meta.get('base') if isinstance(node.meta, dict) else None
+    if base:
+        try:
+            return int(text, base)
+        except ValueError:
+            return 0
+    for parser in (0, 10):
+        try:
+            return int(text, parser)
+        except ValueError:
+            continue
+    return 0
+
+
+BOOT_ORIGIN = 0x7C00
+BOOT_LIMIT = 510
+
+
+class BootCodegen:
+    """Emits a 16-bit real-mode BIOS boot sector in NASM syntax.
+
+    A boot sector runs before any runtime exists, so this back end targets the
+    subset of LOWL that makes sense at that stage: scalar u8/u16 locals and
+    globals, integer arithmetic and comparisons, if/elif/else, while,
+    for-range, functions with up to three parameters, inline asm, string
+    literals, and a few BIOS builtins (print, putc, newline, clear_screen,
+    read_key, halt, print_u16, print_hex, delay).
+    """
+
+    ARG_REGS = ['ax', 'bx', 'cx']
+
+    BUILTINS = {'print', 'putc', 'newline', 'clear_screen', 'read_key', 'halt',
+                'print_u16', 'print_hex', 'delay'}
+
+    def __init__(self, symbols, opt_level=None):
+        self.symbols = symbols
+        self.text: List[str] = []
+        self.rodata: List[str] = []
+        self.bss: List[str] = []
+        self.locals: dict = {}
+        self.globals: dict = {}
+        self.frame = 0
+        self.return_label: Optional[str] = None
+        self.break_labels: List[str] = []
+        self.continue_labels: List[str] = []
+        self.counter = 0
+        self.strings: dict = {}
+        self.helpers: set = set()
+        self.problems: List[str] = []
+        self.functions: dict = {}
+
+    # -- emission ------------------------------------------------------
+    def emit(self, line: str = "") -> None:
+        self.text.append(f"    {line}" if line else "")
+
+    def raw(self, line: str) -> None:
+        self.text.append(line)
+
+    def label(self, name: str) -> None:
+        self.text.append(f"{name}:")
+
+    def new_label(self, prefix: str = "L") -> str:
+        self.counter += 1
+        return f".{prefix}{self.counter}"
+
+    def note(self, message: str) -> None:
+        self.problems.append(message)
+        self.emit(f"; NOTE: {message}")
+
+    # -- driver --------------------------------------------------------
+    def generate(self, program: ASTNode) -> str:
+        self.text.clear()
+        self.rodata.clear()
+        self.bss.clear()
+
+        body = []
+        for child in program.children:
+            if child.type == ASTType.FUNCTION:
+                self.functions[child.value] = child
+            elif child.type == ASTType.ASSIGN and child.meta.get('is_declaration'):
+                body.append(child)
+            elif child.type in (ASTType.BLOCK,):
+                body.extend(child.children)
+
+        self.emit("; ============================================================================")
+        self.emit("; lowl boot sector - 16-bit real mode, loaded by the BIOS at 0x7C00")
+        self.emit("; Generated by lowlc.py -f boot")
+        self.emit("; ============================================================================")
+        self.raw("bits 16")
+        self.raw(f"org 0x{BOOT_ORIGIN:04X}")
+        self.raw("")
+        self.raw("start:")
+        self.emit("cli")
+        self.emit("xor ax, ax")
+        self.emit("mov ds, ax")
+        self.emit("mov es, ax")
+        self.emit("mov ss, ax")
+        self.emit("mov sp, 0x7C00")
+        self.emit("sti")
+        self.emit("cld")
+
+        for decl in body:
+            self.gen_global_decl(decl)
+
+        entry = 'main' if 'main' in self.functions else None
+        if entry is None:
+            self.note("no main() found; the boot sector halts immediately")
+        else:
+            self.emit(f"call fn_{entry}")
+
+        self.emit("cli")
+        self.emit("hlt")
+        stop = self.new_label("halt")
+        self.label(stop)
+        self.emit(f"jmp {stop}")
+        self.raw("")
+
+        for name, fn in self.functions.items():
+            self.gen_function(fn)
+
+        self.gen_helpers()
+
+        out = "\n".join(self.text) + "\n"
+        if self.rodata:
+            out += "\n".join(self.rodata) + "\n"
+        if self.bss:
+            out += "\n".join(self.bss) + "\n"
+        out += "\n; pad to 510 bytes and close with the boot signature\n"
+        out += f"times {BOOT_LIMIT} - ($ - $$) db 0\n"
+        out += "dw 0xAA55\n"
+        return out
+
+    # -- data ----------------------------------------------------------
+    def string_label(self, text: str) -> str:
+        if text in self.strings:
+            return self.strings[text]
+        label = f"str_{len(self.strings)}"
+        self.strings[text] = label
+        data = ", ".join(str(b) for b in text.encode('utf-8')) + ", 0"
+        self.rodata.append(f"{label}: db {data}")
+        return label
+
+    def gen_global_decl(self, node: ASTNode) -> None:
+        lhs = node.children[0]
+        name = lhs.value
+        self.globals[name] = True
+        if len(node.children) > 1:
+            self.gen_expr(node.children[1])
+            self.emit(f"mov [{name}], ax")
+            self.rodata.append(f"{name}: dw 0")
+        else:
+            self.bss.append(f"{name}: resw 1")
+
+    # -- functions -----------------------------------------------------
+    def gen_function(self, node: ASTNode) -> None:
+        name = node.value
+        params = getattr(node, 'function_param_names', None)
+        if not params:
+            params = [ref.name for ref in (node.meta.get('param_refs') or []) if getattr(ref, 'name', None)]
+        body = None
+
+        self.locals = {}
+        self.frame = 0
+        self.return_label = self.new_label("ret")
+        self.break_labels = []
+        self.continue_labels = []
+
+        self.raw("")
+        self.raw(f"; function {name}")
+        self.raw(f"fn_{name}:")
+        self.emit("push bp")
+        self.emit("mov bp, sp")
+
+        if len(params) > len(self.ARG_REGS):
+            self.note(f"{name}: only {len(self.ARG_REGS)} parameters are supported in the boot target")
+            params = params[:len(self.ARG_REGS)]
+
+        for index, pname in enumerate(params):
+            self.frame += 2
+            offset = -self.frame
+            self.locals[pname] = offset
+            self.emit(f"mov [bp{offset:+d}], {self.ARG_REGS[index]}")
+
+        for stmt in node.children:
+            if stmt is not None:
+                self.gen_stmt(stmt)
+
+        self.emit("xor ax, ax")
+        self.label(self.return_label)
+        self.emit("mov sp, bp")
+        self.emit("pop bp")
+        self.emit("ret")
+
+    # -- statements ----------------------------------------------------
+    def gen_block(self, node: ASTNode) -> None:
+        for stmt in node.children:
+            if stmt is not None:
+                self.gen_stmt(stmt)
+
+    def gen_stmt(self, node: ASTNode) -> None:
+        t = node.type
+        if t == ASTType.BLOCK:
+            self.gen_block(node)
+        elif t == ASTType.ASSIGN:
+            self.gen_assign(node)
+        elif t == ASTType.IF_STMT:
+            self.gen_if(node)
+        elif t == ASTType.WHILE_STMT:
+            self.gen_while(node)
+        elif t == ASTType.FOR_STMT:
+            self.gen_for(node)
+        elif t == ASTType.RETURN_STMT:
+            self.gen_return(node)
+        elif t in (ASTType.CALL, ASTType.BUILTIN_CALL):
+            self.gen_expr(node)
+        elif t == ASTType.ASM_STMT:
+            for line in str(node.value).split(';'):
+                if line.strip():
+                    self.raw(f"    {line.strip()}")
+        elif t == ASTType.BREAK_STMT:
+            if self.break_labels:
+                self.emit(f"jmp {self.break_labels[-1]}")
+        elif t == ASTType.CONTINUE_STMT:
+            if self.continue_labels:
+                self.emit(f"jmp {self.continue_labels[-1]}")
+        elif t in (ASTType.FUNCTION, ASTType.STRUCT_DEF, ASTType.CLASS,
+                   ASTType.IMPL_BLOCK, ASTType.TEMPLATE_DECL, ASTType.ENUM_DEF,
+                   ASTType.PRAGMA, ASTType.IMPORT_STMT):
+            pass
+        elif t == ASTType.SWITCH_STMT:
+            self.note("switch is not supported in the boot target")
+        else:
+            self.note(f"{t.name.lower()} statement is not supported in the boot target")
+
+    def gen_assign(self, node: ASTNode) -> None:
+        lhs = node.children[0]
+        value = node.children[1] if len(node.children) > 1 else None
+
+        if lhs.type != ASTType.VARIABLE:
+            self.note("only scalar variables can be assigned in the boot target")
+            return
+
+        name = lhs.value
+        if node.meta.get('is_declaration') and name not in self.globals:
+            if name not in self.locals:
+                self.frame += 2
+                self.locals[name] = -self.frame
+            target = f"[bp{self.locals[name]:+d}]"
+        elif name in self.locals:
+            target = f"[bp{self.locals[name]:+d}]"
+        elif name in self.globals:
+            target = f"[{name}]"
+        else:
+            self.note(f"unknown variable '{name}'")
+            return
+
+        if value is not None:
+            self.gen_expr(value)
+        else:
+            self.emit("xor ax, ax")
+        self.emit(f"mov {target}, ax")
+
+    def gen_if(self, node: ASTNode) -> None:
+        cond = node.children[0]
+        then_block = node.children[1] if len(node.children) > 1 else None
+        rest = node.children[2:]
+
+        else_label = self.new_label("else")
+        end_label = self.new_label("endif")
+
+        self.gen_expr(cond)
+        self.emit("test ax, ax")
+        self.emit(f"jz {else_label}")
+        if then_block is not None:
+            self.gen_block(then_block)
+
+        if rest:
+            self.emit(f"jmp {end_label}")
+            self.label(else_label)
+            for branch in rest:
+                if branch.type == ASTType.IF_STMT:
+                    self.gen_if(branch)
+                else:
+                    self.gen_block(branch)
+            self.label(end_label)
+        else:
+            self.label(else_label)
+
+    def gen_while(self, node: ASTNode) -> None:
+        cond = node.children[0]
+        body = node.children[1] if len(node.children) > 1 else None
+
+        top = self.new_label("while")
+        end = self.new_label("endwhile")
+
+        self.label(top)
+        self.gen_expr(cond)
+        self.emit("test ax, ax")
+        self.emit(f"jz {end}")
+
+        self.break_labels.append(end)
+        self.continue_labels.append(top)
+        if body is not None:
+            self.gen_block(body)
+        self.break_labels.pop()
+        self.continue_labels.pop()
+
+        self.emit(f"jmp {top}")
+        self.label(end)
+
+    def gen_for(self, node: ASTNode) -> None:
+        if node.value != 'range' or len(node.children) < 4:
+            self.note("only 'for i in a..b' loops are supported in the boot target")
+            return
+
+        var_node, start, end_expr = node.children[0], node.children[1], node.children[2]
+        body = node.children[-1]
+        step_expr = node.children[3] if len(node.children) == 5 else None
+        name = var_node.value
+
+        if name not in self.locals:
+            self.frame += 2
+            self.locals[name] = -self.frame
+        slot = f"[bp{self.locals[name]:+d}]"
+
+        self.gen_expr(start)
+        self.emit(f"mov {slot}, ax")
+        self.gen_expr(end_expr)
+        self.emit("mov dx, ax")          # dx holds the exclusive bound
+
+        top = self.new_label("for")
+        end = self.new_label("endfor")
+        step = self.new_label("forstep")
+
+        self.label(top)
+        self.emit(f"mov ax, {slot}")
+        self.emit("cmp ax, dx")
+        self.emit(f"jae {end}")
+
+        self.break_labels.append(end)
+        self.continue_labels.append(step)
+        self.gen_block(body)
+        self.break_labels.pop()
+        self.continue_labels.pop()
+
+        self.label(step)
+        self.emit(f"mov ax, {slot}")
+        if step_expr is not None:
+            self.emit("push ax")
+            self.gen_expr(step_expr)
+            self.emit("mov bx, ax")
+            self.emit("pop ax")
+            self.emit("add ax, bx")
+        else:
+            self.emit("inc ax")
+        self.emit(f"mov {slot}, ax")
+        self.emit(f"jmp {top}")
+        self.label(end)
+
+    def gen_return(self, node: ASTNode) -> None:
+        if node.children:
+            self.gen_expr(node.children[0])
+        else:
+            self.emit("xor ax, ax")
+        if self.return_label:
+            self.emit(f"jmp {self.return_label}")
+
+    # -- expressions ---------------------------------------------------
+    def gen_expr(self, node: Optional[ASTNode]) -> None:
+        if node is None:
+            self.emit("xor ax, ax")
+            return
+
+        t = node.type
+        if t == ASTType.LITERAL:
+            if node.meta.get('is_string') or (isinstance(node.value, str)
+                                              and not self._is_number(node.value)):
+                self.emit(f"mov ax, {self.string_label(str(node.value))}")
+            else:
+                self.emit(f"mov ax, {literal_int(node) & 0xFFFF}")
+        elif t == ASTType.VARIABLE:
+            name = node.value
+            if name in self.locals:
+                self.emit(f"mov ax, [bp{self.locals[name]:+d}]")
+            elif name in self.globals:
+                self.emit(f"mov ax, [{name}]")
+            else:
+                self.note(f"unknown variable '{name}'")
+                self.emit("xor ax, ax")
+        elif t == ASTType.BINARY_OP:
+            self.gen_binary(node)
+        elif t == ASTType.UNARY_OP:
+            self.gen_unary(node)
+        elif t == ASTType.CALL or t == ASTType.BUILTIN_CALL:
+            self.gen_call(node)
+        elif t == ASTType.TYPE_CONVERSION:
+            self.gen_expr(node.children[0] if node.children else None)
+            target = str(node.value or '').lower()
+            if target in ('u8', 'i8', 'char', 'bool', 'bit'):
+                self.emit("and ax, 0xFF")
+        elif t == ASTType.MEMBER_ACCESS:
+            self.note("struct member access is not supported in the boot target")
+            self.emit("xor ax, ax")
+        elif t == ASTType.INDEX:
+            self.note("array indexing is not supported in the boot target")
+            self.emit("xor ax, ax")
+        elif t == ASTType.METHOD_CALL:
+            self.note("method calls are not supported in the boot target")
+            self.emit("xor ax, ax")
+        elif t == ASTType.TUPLE or t == ASTType.ARRAY_LITERAL:
+            self.note("aggregate literals are not supported in the boot target")
+            self.emit("xor ax, ax")
+        else:
+            self.note(f"{t.name.lower()} expression is not supported in the boot target")
+            self.emit("xor ax, ax")
+
+    @staticmethod
+    def _is_number(text: str) -> bool:
+        for parser in (0, 10, 16):
+            try:
+                int(text, parser)
+                return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    def gen_binary(self, node: ASTNode) -> None:
+        op = str(node.value or '').lower()
+        left = node.children[0] if node.children else None
+        right = node.children[1] if len(node.children) > 1 else None
+
+        if op in ('and', '&&', 'or', '||'):
+            self.gen_expr(left)
+            self.emit("push ax")
+            self.gen_expr(right)
+            self.emit("mov bx, ax")
+            self.emit("pop ax")
+            self.emit("test ax, ax")
+            self.emit("setne al")
+            self.emit("xor ah, ah")
+            self.emit("test bx, bx")
+            self.emit("setne bl")
+            self.emit("xor bh, bh")
+            self.emit("and ax, bx" if op in ('and', '&&') else "or ax, bx")
+            return
+
+        self.gen_expr(left)
+        self.emit("push ax")
+        self.gen_expr(right)
+        self.emit("mov bx, ax")
+        self.emit("pop ax")
+
+        simple = {
+            '+': "add ax, bx", '-': "sub ax, bx", '*': "imul bx",
+            '&': "and ax, bx", '|': "or ax, bx", '^': "xor ax, bx",
+        }
+        if op in simple:
+            self.emit(simple[op])
+            return
+        if op in ('/', '%'):
+            self.emit("xor dx, dx")
+            self.emit("div bx")
+            if op == '%':
+                self.emit("mov ax, dx")
+            return
+        if op == '<<':
+            self.emit("mov cx, bx")
+            self.emit("shl ax, cl")
+            return
+        if op == '>>':
+            self.emit("mov cx, bx")
+            self.emit("shr ax, cl")
+            return
+
+        compare = {'==': 'e', '!=': 'ne', '<': 'b', '<=': 'be', '>': 'a', '>=': 'ae'}
+        if op in compare:
+            self.emit("cmp ax, bx")
+            self.emit(f"set{compare[op]} al")
+            self.emit("xor ah, ah")
+            return
+
+        self.note(f"operator '{op}' is not supported in the boot target")
+        self.emit("xor ax, ax")
+
+    def gen_unary(self, node: ASTNode) -> None:
+        op = str(node.value or '').lower()
+        self.gen_expr(node.children[0] if node.children else None)
+        if op in ('-', 'neg'):
+            self.emit("neg ax")
+        elif op in ('not', '!'):
+            self.emit("test ax, ax")
+            self.emit("sete al")
+            self.emit("xor ah, ah")
+        elif op == '~':
+            self.emit("not ax")
+
+    def gen_call(self, node: ASTNode) -> None:
+        name = str(node.value or '')
+        args = node.children[1:] if node.children and node.children[0].type == ASTType.VARIABLE \
+            else list(node.children)
+        low = name.lower()
+
+        if low in self.BUILTINS:
+            self.gen_builtin(low, args)
+            return
+
+        if name not in self.functions:
+            self.note(f"call to unknown function '{name}'")
+            self.emit("xor ax, ax")
+            return
+
+        if len(args) > len(self.ARG_REGS):
+            self.note(f"{name}: only {len(self.ARG_REGS)} arguments are supported in the boot target")
+            args = args[:len(self.ARG_REGS)]
+
+        for arg in args:
+            self.gen_expr(arg)
+            self.emit("push ax")
+        for index in range(len(args) - 1, -1, -1):
+            self.emit(f"pop {self.ARG_REGS[index]}")
+
+        self.emit(f"call fn_{name}")
+
+    def gen_builtin(self, name: str, args: List[ASTNode]) -> None:
+        def first_arg() -> None:
+            self.gen_expr(args[0] if args else None)
+
+        if name == 'print':
+            self.helpers.add('print')
+            arg = args[0] if args else None
+            if arg is not None and arg.type == ASTType.LITERAL and arg.meta.get('is_string'):
+                self.emit(f"mov si, {self.string_label(str(arg.value))}")
+            else:
+                first_arg()
+                self.emit("mov si, ax")
+            self.emit("call boot_print")
+        elif name == 'putc':
+            self.helpers.add('putc')
+            first_arg()
+            self.emit("call boot_putc")
+        elif name == 'newline':
+            self.helpers.update(('newline', 'putc'))
+            self.emit("call boot_newline")
+        elif name == 'clear_screen':
+            self.emit("mov ax, 0x0003")
+            self.emit("int 0x10")
+        elif name == 'read_key':
+            self.emit("xor ah, ah")
+            self.emit("int 0x16")
+        elif name == 'halt':
+            self.emit("cli")
+            self.emit("hlt")
+            stop = self.new_label("halt")
+            self.label(stop)
+            self.emit(f"jmp {stop}")
+        elif name == 'print_u16':
+            self.helpers.update(('print_u16', 'putc'))
+            first_arg()
+            self.emit("call boot_print_u16")
+        elif name == 'print_hex':
+            self.helpers.update(('print_hex', 'putc'))
+            first_arg()
+            self.emit("call boot_print_hex")
+        elif name == 'delay':
+            first_arg()
+            self.emit("mov cx, ax")
+            self.emit("call boot_delay")
+        else:
+            self.note(f"builtin '{name}' is not supported in the boot target")
+            self.emit("xor ax, ax")
+
+    # -- runtime helpers -----------------------------------------------
+    def gen_helpers(self) -> None:
+        if 'putc' in self.helpers:
+            self.raw("")
+            self.raw("; BIOS teletype output, al = character")
+            self.raw("boot_putc:")
+            self.emit("push ax")
+            self.emit("push bx")
+            self.emit("push cx")
+            self.emit("push dx")
+            self.emit("mov ah, 0x0E")
+            self.emit("mov bx, 0x0007")
+            self.emit("int 0x10")
+            self.emit("pop dx")
+            self.emit("pop cx")
+            self.emit("pop bx")
+            self.emit("pop ax")
+            self.emit("ret")
+
+        if 'newline' in self.helpers:
+            self.raw("")
+            self.raw("; carriage return + line feed")
+            self.raw("boot_newline:")
+            self.emit("push ax")
+            self.emit("mov ax, 13")
+            self.emit("call boot_putc")
+            self.emit("mov ax, 10")
+            self.emit("call boot_putc")
+            self.emit("pop ax")
+            self.emit("ret")
+
+        if 'print' in self.helpers:
+            self.raw("")
+            self.raw("; print the NUL-terminated string at ds:si")
+            self.raw("boot_print:")
+            self.emit("push ax")
+            self.emit("push si")
+            loop = self.new_label("print")
+            done = self.new_label("printdone")
+            self.label(loop)
+            self.emit("lodsb")
+            self.emit("test al, al")
+            self.emit(f"jz {done}")
+            self.emit("call boot_putc")
+            self.emit(f"jmp {loop}")
+            self.label(done)
+            self.emit("pop si")
+            self.emit("pop ax")
+            self.emit("ret")
+
+        if 'print_u16' in self.helpers:
+            self.raw("")
+            self.raw("; print ax as unsigned decimal")
+            self.raw("boot_print_u16:")
+            self.emit("push ax")
+            self.emit("push bx")
+            self.emit("push cx")
+            self.emit("push dx")
+            self.emit("mov bx, 10")
+            self.emit("xor cx, cx")
+            divide = self.new_label("div")
+            emit_digits = self.new_label("digits")
+            self.label(divide)
+            self.emit("xor dx, dx")
+            self.emit("div bx")
+            self.emit("push dx")
+            self.emit("inc cx")
+            self.emit("test ax, ax")
+            self.emit(f"jnz {divide}")
+            self.label(emit_digits)
+            self.emit("pop ax")
+            self.emit("add al, 0x30")
+            self.emit("call boot_putc")
+            self.emit(f"loop {emit_digits}")
+            self.emit("pop dx")
+            self.emit("pop cx")
+            self.emit("pop bx")
+            self.emit("pop ax")
+            self.emit("ret")
+
+        if 'print_hex' in self.helpers:
+            self.raw("")
+            self.raw("; print ax as four hex digits")
+            self.raw("boot_print_hex:")
+            self.emit("push ax")
+            self.emit("push bx")
+            self.emit("push cx")
+            self.emit("push dx")
+            self.emit("mov dx, ax")
+            self.emit("mov cx, 4")
+            digit = self.new_label("hex")
+            self.label(digit)
+            self.emit("rol dx, 4")
+            self.emit("mov ax, dx")
+            self.emit("and ax, 0x000F")
+            self.emit("cmp al, 10")
+            self.emit("jb .hexdigit")
+            self.emit("add al, 0x27")
+            self.raw(".hexdigit:")
+            self.emit("add al, 0x30")
+            self.emit("push dx")
+            self.emit("call boot_putc")
+            self.emit("pop dx")
+            self.emit(f"loop {digit}")
+            self.emit("pop dx")
+            self.emit("pop cx")
+            self.emit("pop bx")
+            self.emit("pop ax")
+            self.emit("ret")
+
+        if 'delay' in self.helpers:
+            self.raw("")
+            self.raw("; busy-wait roughly cx * 65536 iterations")
+            self.raw("boot_delay:")
+            self.emit("push cx")
+            self.emit("push dx")
+            outer = self.new_label("delay")
+            self.label(outer)
+            self.emit("mov dx, 0xFFFF")
+            inner = self.new_label("delayin")
+            self.label(inner)
+            self.emit("dec dx")
+            self.emit(f"jnz {inner}")
+            self.emit(f"loop {outer}")
+            self.emit("pop dx")
+            self.emit("pop cx")
+            self.emit("ret")
+
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
 class Compiler:
     def __init__(self, backend: Backend = Backend.NASM, opt_level: OptimizationLevel = OptimizationLevel.O2,
                  output_format: OutputFormat = OutputFormat.ELF_EXECUTABLE, verbose: bool = False):
@@ -4706,8 +5440,14 @@ class Compiler:
         if self.verbose:
             print("Parser: AST built")
             
-        generator = CodeGenerator(self.backend, self.symbols, self.opt_level, self.output_format)
-        asm_code = generator.generate(ast)
+        if self.output_format == OutputFormat.BOOT_IMAGE:
+            boot = BootCodegen(self.symbols)
+            asm_code = boot.generate(ast)
+            for problem in boot.problems:
+                print(f"note: {problem}")
+        else:
+            generator = CodeGenerator(self.backend, self.symbols, self.opt_level, self.output_format)
+            asm_code = generator.generate(ast)
         
         try:
             with open(output_file, 'w') as f:

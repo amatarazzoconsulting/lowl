@@ -1,0 +1,60 @@
+// boot_demo.lowl - a BIOS boot sector written in lowl
+//
+// Build a 512-byte bootable image:
+//   python3 lowlc.py boot_demo.lowl -f boot -o boot.asm
+//   nasm -f bin boot.asm -o boot.img
+//   python3 tools/build_boot_image.py boot.asm -o boot.img    (no nasm needed)
+//
+// Run it in QEMU:
+//   qemu-system-x86_64 -drive format=raw,file=boot.img
+//
+// The BIOS loads the image at 0x7C00 and jumps to it in 16-bit real mode with
+// no operating system, no runtime and no libc. Everything below runs on the
+// bare CPU plus the BIOS video and keyboard interrupts.
+
+// Paint row 1 of the VGA text buffer (0xB8000) as a blue separator bar. The
+// boot target has no far pointers, so this uses the inline assembly escape
+// hatch the manual describes for segment:offset memory.
+fn paint_bar():
+    asm("mov ax, 0xB800")
+    asm("mov es, ax")
+    asm("mov di, 160")           // row 1, column 0
+    asm("mov cx, 80")
+    asm("mov ax, 0x1F20")        // white on blue, blank cell
+    asm("rep stosw")
+    asm("xor ax, ax")
+    asm("mov es, ax")            // give ES back to the BIOS
+
+// Print 1^2 .. limit^2 using compiled arithmetic.
+fn squares(limit: u16):
+    let mut n: u16 = 1
+    while n <= limit:
+        print_u16(n)
+        print("^2=")
+        print_u16(n * n)
+        print(" ")
+        n = n + 1
+
+// Count down so you can see the CPU actually executing a loop.
+fn countdown():
+    let mut t: u16 = 3
+    while t > 0:
+        print_u16(t)
+        print(" ")
+        t = t - 1
+
+fn main() -> u16:
+    clear_screen()
+    print("lowl v2.1.0 boot sector")
+    paint_bar()
+    print("\r\n\r\nno OS, no libc\r\n\r\nsquares: ")
+    squares(5)
+    print("\r\ncount: ")
+    countdown()
+    print("\r\n\r\nkey? ")
+    let key: u16 = read_key()
+    print("code ")
+    print_u16(key)
+    print("\r\nhalt")
+    halt()
+    return 0
