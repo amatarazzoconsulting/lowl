@@ -100,6 +100,10 @@ class DataType(Enum):
     TEMPLATE = 34
     OPTION = 35
     MODULE = 36
+    STRING = 37
+    TUPLE = 38
+    FN = 39
+    STRUCT = 40
 
 @dataclass
 class DataTypeInfo:
@@ -177,6 +181,11 @@ class TokenType(Enum):
     NEWLINE = 300; INDENT = 301; DEDENT = 302
     OP_TEMPLATE_LT = 303; OP_TEMPLATE_GT = 304
     PRAGMA_OPTIMIZE = 400; PRAGMA_SIMD = 401; PRAGMA_UNROLL = 402
+    TOK_CHAR = 7
+    KW_MUT = 72; KW_STATIC = 73; KW_IMPL = 74; KW_ABSTRACT = 75
+    KW_SELF = 76; KW_BREAK = 77; KW_CONTINUE = 78; KW_DEFAULT = 79
+    KW_STEP = 80; KW_STRING = 81; KW_ARRAY = 82; KW_AS = 83
+    OP_POW = 262
 
 @dataclass
 class Token:
@@ -205,6 +214,9 @@ class ASTType(Enum):
     TYPE_CONVERSION = 35
     ASM_STMT = 36
     ATTRIBUTE = 37
+    INDEX = 38; ARRAY_LITERAL = 39; STRUCT_LITERAL = 40; LAMBDA = 41
+    STRUCT_DEF = 42; IMPL_BLOCK = 43; BREAK_STMT = 44; CONTINUE_STMT = 45
+    TUPLE = 46; ENUM_DEF = 47
 
 @dataclass
 class ASTNode:
@@ -237,7 +249,8 @@ class ASTNode:
     data_format: str = ""
     unroll_factor: int = 0
     attributes: List[str] = field(default_factory=list)
-    
+    meta: Dict[str, object] = field(default_factory=dict)
+
     def add_child(self, child: 'ASTNode') -> None:
         if child:
             self.children.append(child)
@@ -263,6 +276,7 @@ class Symbol:
     is_imported: bool = False
     module_name: str = ""
     attributes: List[str] = field(default_factory=list)
+    type_ref: object = None
 
 class SymbolTable:
     def __init__(self):
@@ -271,6 +285,46 @@ class SymbolTable:
         self.next_stack_offset = -8
         self.imported_symbols: Dict[str, str] = {}
         self.exported_symbols: Set[str] = set()
+        self.structs: Dict[str, Dict[str, object]] = {}
+        self.functions: List[object] = []
+
+    def define_struct(self, name: str, fields) -> None:
+        offset = 0
+        layout_fields = []
+        for fname, fref in fields:
+            fsize = max(1, type_size(fref, self))
+            falign = max(1, min(8, type_align(fref, self)))
+            offset = (offset + falign - 1) // falign * falign
+            layout_fields.append((fname, fref, offset))
+            offset += fsize
+        size = max(1, (offset + 7) & ~7)
+        self.structs[name] = {'fields': layout_fields, 'size': size}
+
+    def struct_layout(self, name: str):
+        return self.structs.get(name)
+
+    def struct_size(self, name: str) -> int:
+        layout = self.structs.get(name)
+        return layout['size'] if layout else 8
+
+    def field_offset(self, struct_name: str, field_name: str):
+        layout = self.structs.get(struct_name)
+        if not layout:
+            return None
+        for fname, fref, offset in layout['fields']:
+            if fname == field_name:
+                return offset, fref
+        return None
+
+    def field_ref(self, struct_name: str, field_name: str):
+        found = self.field_offset(struct_name, field_name)
+        return found[1] if found else None
+
+    def register_function(self, name: str, node) -> None:
+        self.functions.append(node)
+
+    def find_functions(self, name: str) -> List[object]:
+        return [f for f in self.functions if f.value == name]
         
     def enter_scope(self) -> None:
         self.scopes.append({})
@@ -294,15 +348,19 @@ class SymbolTable:
                 return info
         return DATA_TYPE_TABLE[0]
             
-    def declare(self, name: str, dtype: DataType, line: int, column: int, 
-                is_global: bool = False, is_block_array: bool = False, 
+    def declare(self, name: str, dtype: DataType, line: int, column: int,
+                is_global: bool = False, is_block_array: bool = False,
                 block_array_type: Optional[DataType] = None,
-                is_exported: bool = False, attributes: List[str] = None) -> bool:
+                is_exported: bool = False, attributes: List[str] = None,
+                type_ref=None) -> bool:
         if name in self.scopes[self.current_scope]:
             return False
-        
-        type_info = self.get_type_info(dtype)
-        size = type_info.size
+
+        if type_ref is not None:
+            size = max(1, type_size(type_ref, self))
+        else:
+            type_info = self.get_type_info(dtype)
+            size = type_info.size
         
         sym = Symbol(name=name, type=dtype, scope_level=self.current_scope,
                      stack_offset=self.next_stack_offset, is_global=is_global, 
@@ -572,9 +630,25 @@ class Lexer:
                 num += self.current()
                 self.advance()
             return Token(TokenType.TOK_BINARY, num, start_line, start_col, self.filename)
-        while self.current().isdigit() or self.current() == '.':
+        while self.current().isdigit():
             num += self.current()
             self.advance()
+        # fractional part (but never consume '..' which starts a range)
+        if self.current() == '.' and self.peek() != '.' and self.peek().isdigit():
+            num += self.current()
+            self.advance()
+            while self.current().isdigit():
+                num += self.current()
+                self.advance()
+        if self.current() in 'eE' and (self.peek().isdigit() or self.peek() in '+-'):
+            num += self.current()
+            self.advance()
+            if self.current() in '+-':
+                num += self.current()
+                self.advance()
+            while self.current().isdigit():
+                num += self.current()
+                self.advance()
         return Token(TokenType.TOK_NUMBER, num, start_line, start_col, self.filename)
         
     def read_string(self) -> Token:
@@ -596,10 +670,14 @@ class Lexer:
             self.advance()
         if self.current() == delim:
             self.advance()
+        if delim == "'":
+            return Token(TokenType.TOK_CHAR, s, start_line, start_col, self.filename)
         return Token(TokenType.TOK_STRING, s, start_line, start_col, self.filename)
     
     def read_attribute(self) -> Token:
         start_line, start_col = self.line, self.column
+        if self.current() == '#':
+            self.advance()
         self.advance()  # Skip '['
         attr_name = ""
         while self.current() != ']' and self.current() != '\0':
@@ -688,6 +766,14 @@ class Lexer:
             'f32': TokenType.KW_F32, 'f64': TokenType.KW_F64, 'bool': TokenType.KW_BOOL, 'char': TokenType.KW_CHAR,
             'ptr': TokenType.KW_PTR, 'mmio_ptr': TokenType.KW_MMIO_PTR, 'bit': TokenType.KW_BIT,
             'vec4_f32': TokenType.KW_VEC4_F32, 'vec8_f32': TokenType.KW_VEC8_F32, 'vec16_f32': TokenType.KW_VEC16_F32,
+            'mut': TokenType.KW_MUT, 'static': TokenType.KW_STATIC, 'impl': TokenType.KW_IMPL,
+            'abstract': TokenType.KW_ABSTRACT, 'self': TokenType.KW_SELF,
+            'break': TokenType.KW_BREAK, 'continue': TokenType.KW_CONTINUE,
+            'default': TokenType.KW_DEFAULT, 'step': TokenType.KW_STEP,
+            'string': TokenType.KW_STRING, 'array': TokenType.KW_ARRAY,
+            'in': TokenType.KW_IN, 'elif': TokenType.KW_ELIF,
+            'and': TokenType.OP_AND, 'or': TokenType.OP_OR, 'not': TokenType.OP_NOT,
+            'as': TokenType.OP_CONVERT,
         }
         
         if ident in kw_map:
@@ -717,6 +803,9 @@ class Lexer:
         if c == '|' and self.current() == '|':
             self.advance()
             return Token(TokenType.OP_OR, "||", start_line, start_col, self.filename)
+        if c == '*' and self.current() == '*':
+            self.advance()
+            return Token(TokenType.OP_POW, "**", start_line, start_col, self.filename)
         if c == '+' and self.current() == '+':
             self.advance()
             return Token(TokenType.OP_INC, "++", start_line, start_col, self.filename)
@@ -781,6 +870,9 @@ class Lexer:
             self.advance(); self.advance()
             return self.next_token()
             
+        if self.current() == '#' and self.peek() == '[':
+            return self.read_attribute()
+            
         if self.current() == '#':
             return self.read_pragma()
             
@@ -793,11 +885,13 @@ class Lexer:
         if self.current() == '"' or self.current() == "'":
             return self.read_string()
             
+        if self.current() == '.' and self.peek() == '.':
+            self.advance(); self.advance()
+            return Token(TokenType.KW_RANGE, "..", self.line, self.column, self.filename)
+            
         if self.current().isalpha() or self.current() == '_':
             return self.read_identifier()
             
-        if self.current() == ':' and self.peek() not in '=:':
-            return self.read_conversion()
             
         return self.read_operator()
 
@@ -861,8 +955,133 @@ def inject_indent_dedent(tokens: List[Token], source: str) -> List[Token]:
 # Parser
 # ============================================================================
 
+# ============================================================================
+# Type References (rich type info: arrays, structs, pointers, functions)
+# ============================================================================
+
+@dataclass
+class TypeRef:
+    base: DataType = DataType.U64
+    name: str = ""
+    elem: Optional['TypeRef'] = None
+    length: int = 0
+    params: List['TypeRef'] = field(default_factory=list)
+    is_mut: bool = False
+    is_ref: bool = False
+    fn_params: List['TypeRef'] = field(default_factory=list)
+    fn_return: Optional['TypeRef'] = None
+
+    def __repr__(self) -> str:
+        if self.base == DataType.ARRAY and self.elem:
+            return f"array<{self.elem!r}, {self.length}>"
+        if self.base == DataType.STRUCT:
+            return self.name
+        if self.base == DataType.PTR and self.elem:
+            return f"ptr<{self.elem!r}>"
+        if self.base == DataType.PTR_MUT and self.elem:
+            return f"ptr_mut<{self.elem!r}>"
+        if self.base == DataType.MMIO_PTR and self.elem:
+            return f"mmio_ptr<{self.elem!r}>"
+        if self.base == DataType.OPTION and self.elem:
+            return f"Option<{self.elem!r}>"
+        if self.base == DataType.TUPLE:
+            return "(" + ", ".join(repr(p) for p in self.params) + ")"
+        if self.base == DataType.FN:
+            return "fn(" + ", ".join(repr(p) for p in self.fn_params) + ")"
+        return self.base.name.lower()
+
+
+PRIMITIVE_TYPES = {
+    'u8': DataType.U8, 'u16': DataType.U16, 'u32': DataType.U32, 'u64': DataType.U64,
+    'u128': DataType.U128,
+    'i8': DataType.I8, 'i16': DataType.I16, 'i32': DataType.I32, 'i64': DataType.I64,
+    'i128': DataType.I128,
+    'f32': DataType.F32, 'f64': DataType.F64, 'f80': DataType.F80,
+    'bool': DataType.BOOL, 'char': DataType.CHAR, 'bit': DataType.BIT,
+    'string': DataType.STRING, 'void': DataType.VOID,
+    'vec4_f32': DataType.VEC4_F32, 'vec8_f32': DataType.VEC8_F32,
+    'vec16_f32': DataType.VEC16_F32, 'vec2_f64': DataType.VEC2_F64,
+    'vec4_f64': DataType.VEC4_F64, 'vec8_f64': DataType.VEC8_F64,
+}
+
+SOFT_KEYWORD_NAMES = {'new', 'delete', 'get', 'set', 'size', 'key', 'end', 'from', 'case',
+                      'default', 'when', 'in', 'step', 'record', 'metadata', 'priority'}
+
+TYPE_START_TOKENS = {TokenType.KW_U8, TokenType.KW_U16, TokenType.KW_U32, TokenType.KW_U64,
+                     TokenType.KW_I8, TokenType.KW_I16, TokenType.KW_I32, TokenType.KW_I64,
+                     TokenType.KW_F32, TokenType.KW_F64, TokenType.KW_BOOL, TokenType.KW_CHAR,
+                     TokenType.KW_PTR, TokenType.KW_MMIO_PTR, TokenType.KW_BIT,
+                     TokenType.KW_STRING, TokenType.KW_ARRAY, TokenType.KW_VEC4_F32,
+                     TokenType.KW_VEC8_F32, TokenType.KW_VEC16_F32, TokenType.KW_BLOCK_ARRAY,
+                     TokenType.KW_OPTION}
+
+INTEGER_TYPES = {DataType.U8, DataType.U16, DataType.U32, DataType.U64, DataType.U128,
+                 DataType.I8, DataType.I16, DataType.I32, DataType.I64, DataType.I128,
+                 DataType.BOOL, DataType.CHAR, DataType.BIT}
+FLOAT_TYPES = {DataType.F32, DataType.F64, DataType.F80}
+POINTER_TYPES = {DataType.PTR, DataType.PTR_MUT, DataType.MMIO_PTR, DataType.STRING, DataType.FN}
+
+
+def type_size(ref, symbols=None) -> int:
+    """Byte size of a type as laid out in memory."""
+    if ref is None:
+        return 8
+    base = ref.base
+    if base in INTEGER_TYPES or base in FLOAT_TYPES:
+        for info in DATA_TYPE_TABLE:
+            if info.type == base:
+                return info.size
+        return 8
+    if base in POINTER_TYPES:
+        return 8
+    if base == DataType.ARRAY:
+        return max(1, type_size(ref.elem, symbols) * max(1, ref.length))
+    if base == DataType.STRUCT:
+        if symbols is not None:
+            layout = symbols.struct_layout(ref.name)
+            if layout:
+                return layout['size']
+        return 8
+    if base == DataType.OPTION:
+        return type_size(ref.elem, symbols) + 8
+    if base == DataType.TUPLE:
+        total = 0
+        for p in ref.params:
+            total += max(8, type_size(p, symbols))
+        return total
+    if base in (DataType.VEC4_F32, DataType.VEC2_F64):
+        return 16
+    if base in (DataType.VEC8_F32, DataType.VEC4_F64):
+        return 32
+    if base in (DataType.VEC16_F32, DataType.VEC8_F64):
+        return 64
+    return 8
+
+
+def type_align(ref, symbols=None) -> int:
+    size = type_size(ref, symbols)
+    align = 1
+    while align < 8 and align * 2 <= size:
+        align *= 2
+    return align
+
+
+# ============================================================================
+# Parser
+# ============================================================================
+
 class Parser:
-    def __init__(self, tokens: List[Token], symbols: SymbolTable, errors: ErrorCollector, 
+    MODIFIER_TOKENS = {
+        TokenType.KW_INLINE: "inline",
+        TokenType.KW_VIRTUAL: "virtual",
+        TokenType.KW_OVERRIDE: "override",
+        TokenType.KW_ABSTRACT: "abstract",
+        TokenType.KW_PUBLIC: "public",
+        TokenType.KW_PRIVATE: "private",
+        TokenType.KW_PROTECTED: "protected",
+    }
+
+    def __init__(self, tokens: List[Token], symbols: SymbolTable, errors: ErrorCollector,
                  opt_level: OptimizationLevel = OptimizationLevel.O2):
         self.tokens = tokens
         self.pos = 0
@@ -872,801 +1091,1665 @@ class Parser:
         self.current_simd_level = SIMDLevel.NONE
         self.current_unroll_factor = 0
         self.current_attributes: List[str] = []
-        
+        self.known_types: Dict[str, TypeRef] = {}
+        self.current_class: str = ""
+        self.current_visibility: str = "public"
+
+    # -- token helpers ------------------------------------------------------
     def current(self) -> Token:
         return self.tokens[self.pos] if self.pos < len(self.tokens) else Token(TokenType.TOK_EOF, "", 0, 0, "")
-        
+
+    def peek(self, offset: int = 1) -> Token:
+        idx = self.pos + offset
+        return self.tokens[idx] if idx < len(self.tokens) else Token(TokenType.TOK_EOF, "", 0, 0, "")
+
     def advance(self) -> None:
         if self.pos < len(self.tokens):
             self.pos += 1
-            
+
     def match(self, tok_type: TokenType) -> bool:
         if self.current().type == tok_type:
             self.advance()
             return True
         return False
-        
+
+    def match_any(self, *tok_types: TokenType) -> bool:
+        if self.current().type in tok_types:
+            self.advance()
+            return True
+        return False
+
     def expect(self, tok_type: TokenType, msg: str) -> bool:
         if self.current().type != tok_type:
             self.errors.add_error(msg, self.current().line, self.current().column)
             return False
         self.advance()
         return True
-        
+
+    def error(self, msg: str) -> None:
+        self.errors.add_error(msg, self.current().line, self.current().column)
+
+    @staticmethod
+    def is_name_token(tok: Token) -> bool:
+        return bool(tok.value) and str(tok.value).replace('_', 'a').isalnum()
+
+    def skip_soft_newlines(self) -> None:
+        while self.current().type in (TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+            self.advance()
+
+    def skip_to_line_end(self) -> None:
+        while self.current().type not in (TokenType.NEWLINE, TokenType.TOK_EOF, TokenType.DEDENT):
+            self.advance()
+
+    # -- generic brackets ---------------------------------------------------
+    def at_generic_open(self) -> bool:
+        return self.current().type in (TokenType.OP_LT, TokenType.OP_TEMPLATE_LT)
+
+    def at_generic_close(self) -> bool:
+        return self.current().type in (TokenType.OP_GT, TokenType.OP_TEMPLATE_GT, TokenType.OP_SHR)
+
+    def expect_generic_open(self, msg: str) -> bool:
+        if self.at_generic_open():
+            self.advance()
+            return True
+        self.error(msg)
+        return False
+
+    def expect_generic_close(self, msg: str) -> bool:
+        tok = self.current()
+        if tok.type in (TokenType.OP_GT, TokenType.OP_TEMPLATE_GT):
+            self.advance()
+            return True
+        if tok.type == TokenType.OP_SHR:
+            # '>>' closes two nested generic lists: consume one '>' now
+            self.tokens[self.pos] = Token(TokenType.OP_GT, ">", tok.line, tok.column, tok.file)
+            return True
+        self.error(msg)
+        return False
+
+    # -- attributes ---------------------------------------------------------
     def parse_attributes(self) -> List[str]:
         attrs = []
         while self.current().type in [TokenType.KW_ATTRIBUTE_START, TokenType.KW_INTERRUPT,
-                                       TokenType.KW_KERNEL, TokenType.KW_INIT, TokenType.KW_SECTION]:
+                                      TokenType.KW_KERNEL, TokenType.KW_INIT, TokenType.KW_SECTION]:
             attrs.append(self.current().value)
             self.advance()
         return attrs
-        
+
+    # -- program ------------------------------------------------------------
     def parse(self) -> ASTNode:
         program = ASTNode(ASTType.PROGRAM, "", 0, 0)
         while self.current().type != TokenType.TOK_EOF:
+            before = self.pos
             stmt = self.parse_statement()
             if stmt:
                 program.add_child(stmt)
-            else:
-                break
+            if self.pos == before:
+                if self.current().type == TokenType.TOK_EOF:
+                    break
+                self.advance()
         return program
-        
+
+    # -- statements ---------------------------------------------------------
     def parse_statement(self) -> Optional[ASTNode]:
         tok = self.current()
-        
-        # Parse attributes if present
+
+        if tok.type in (TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+            self.advance()
+            return None
+
         if tok.type in [TokenType.KW_ATTRIBUTE_START, TokenType.KW_INTERRUPT,
                         TokenType.KW_KERNEL, TokenType.KW_INIT, TokenType.KW_SECTION]:
             attrs = self.parse_attributes()
             stmt = self.parse_statement()
             if stmt:
-                stmt.attributes = attrs
+                stmt.attributes = attrs + list(stmt.attributes)
             return stmt
-        
-        if tok.type == TokenType.PRAGMA_OPTIMIZE:
-            return self.parse_pragma_optimize()
-        elif tok.type == TokenType.PRAGMA_SIMD:
-            return self.parse_pragma_simd()
-        elif tok.type == TokenType.PRAGMA_UNROLL:
-            return self.parse_pragma_unroll()
-        elif tok.type == TokenType.KW_IMPORT:
-            return self.parse_import()
-        elif tok.type == TokenType.KW_EXPORT:
-            return self.parse_export()
-        elif tok.type == TokenType.KW_MODULE:
-            return self.parse_module()
-        elif tok.type == TokenType.KW_LET:
-            return self.parse_let()
-        elif tok.type == TokenType.KW_FN or tok.type == TokenType.KW_DEF:
-            return self.parse_function()
-        elif tok.type == TokenType.KW_CLASS:
-            return self.parse_class()
-        elif tok.type == TokenType.KW_TEMPLATE:
-            return self.parse_template()
-        elif tok.type == TokenType.KW_IF:
-            return self.parse_if()
-        elif tok.type == TokenType.KW_WHILE:
-            return self.parse_while()
-        elif tok.type == TokenType.KW_FOR:
-            return self.parse_for()
-        elif tok.type == TokenType.KW_RETURN:
-            return self.parse_return()
-        elif tok.type == TokenType.KW_SWITCH:
-            return self.parse_switch()
-        elif tok.type == TokenType.KW_DATA_SECTION:
-            return self.parse_data_section()
-        elif tok.type == TokenType.KW_WITH:
-            return self.parse_with()
-        elif tok.type == TokenType.KW_BLOCK_ARRAY:
-            return self.parse_block_array()
-        elif tok.type == TokenType.KW_ASM:
-            return self.parse_asm_statement()
-        elif tok.type == TokenType.OP_LBRACE:
-            return self.parse_block()
-        elif tok.type == TokenType.NEWLINE:
+
+        # visibility sections inside class/struct bodies: "private:" / "public:"
+        if tok.type in (TokenType.KW_PRIVATE, TokenType.KW_PUBLIC, TokenType.KW_PROTECTED) \
+                and self.peek().type == TokenType.OP_COLON:
+            self.current_visibility = self.MODIFIER_TOKENS[tok.type]
             self.advance()
-            return self.parse_statement()
-        elif tok.type == TokenType.INDENT:
             self.advance()
-            return self.parse_statement()
-        elif tok.type == TokenType.DEDENT:
             return None
-        else:
-            expr = self.parse_expression()
-            self.match(TokenType.OP_SEMICOLON)
-            return expr
-    
-    def parse_asm_statement(self) -> Optional[ASTNode]:
-        node = ASTNode(ASTType.ASM_STMT, line=self.current().line, column=self.current().column)
-        if not self.expect(TokenType.KW_ASM, "Expected 'asm'"):
-            return None
-        if not self.expect(TokenType.OP_LPAREN, "Expected '(' after 'asm'"):
-            return None
-        if self.current().type != TokenType.TOK_STRING:
-            self.errors.add_error("Expected assembly instruction string", self.current().line, self.current().column)
-            return None
-        
-        node.value = self.current().value
-        self.advance()
-        
-        if not self.expect(TokenType.OP_RPAREN, "Expected ')' after assembly string"):
-            return None
-        self.match(TokenType.OP_SEMICOLON)
-        return node
-        
-    def parse_pragma_optimize(self) -> Optional[ASTNode]:
-        tok = self.current()
-        self.advance()
-        node = ASTNode(ASTType.PRAGMA, tok.value, tok.line, tok.column)
-        node.optimization_level = {
-            "O0": OptimizationLevel.O0,
-            "O1": OptimizationLevel.O1,
-            "O2": OptimizationLevel.O2,
-            "O3": OptimizationLevel.O3
-        }.get(tok.value, OptimizationLevel.O2)
-        self.current_opt_level = node.optimization_level
-        return node
-        
-    def parse_pragma_simd(self) -> Optional[ASTNode]:
-        tok = self.current()
-        self.advance()
-        node = ASTNode(ASTType.PRAGMA, tok.value, tok.line, tok.column)
-        node.simd_level = {
-            "SSE": SIMDLevel.SSE,
-            "AVX": SIMDLevel.AVX,
-            "AVX512": SIMDLevel.AVX512
-        }.get(tok.value, SIMDLevel.NONE)
-        self.current_simd_level = node.simd_level
-        return node
-        
-    def parse_pragma_unroll(self) -> Optional[ASTNode]:
-        tok = self.current()
-        self.advance()
-        node = ASTNode(ASTType.PRAGMA, tok.value, tok.line, tok.column)
-        node.unroll_factor = int(tok.value) if tok.value.isdigit() else 0
-        self.current_unroll_factor = node.unroll_factor
-        return node
-        
-    def parse_import(self) -> Optional[ASTNode]:
-        node = ASTNode(ASTType.IMPORT_STMT, line=self.current().line, column=self.current().column)
-        self.advance()
-        
-        if self.current().type == TokenType.TOK_STRING:
-            node.import_path = self.current().value
-            self.advance()
-            
-        if self.match(TokenType.KW_FROM):
-            if self.current().type == TokenType.TOK_STRING:
-                node.import_path = self.current().value
+
+        if tok.type in self.MODIFIER_TOKENS:
+            mods = []
+            while self.current().type in self.MODIFIER_TOKENS:
+                mods.append(self.MODIFIER_TOKENS[self.current().type])
                 self.advance()
-                
-        self.match(TokenType.OP_SEMICOLON)
-        return node
-        
-    def parse_export(self) -> Optional[ASTNode]:
-        node = ASTNode(ASTType.EXPORT_STMT, line=self.current().line, column=self.current().column)
-        self.advance()
-        
-        if self.current().type == TokenType.TOK_IDENTIFIER:
-            node.export_name = self.current().value
-            self.symbols.exported_symbols.add(node.export_name)
+            nxt = self.current().type
+            if nxt in (TokenType.KW_FN, TokenType.KW_DEF):
+                return self.parse_function(mods)
+            if nxt == TokenType.KW_CLASS:
+                return self.parse_class(mods)
+            if nxt == TokenType.KW_STRUCT:
+                return self.parse_struct(mods)
+            self.error("Expected declaration after modifier")
+            self.skip_to_line_end()
+            return None
+
+        if tok.type == TokenType.KW_STATIC:
+            if self.peek().type in (TokenType.KW_FN, TokenType.KW_DEF):
+                self.advance()
+                return self.parse_function(["static"])
+            return self.parse_var_decl(is_static=True)
+
+        dispatch = {
+            TokenType.PRAGMA_OPTIMIZE: self.parse_pragma_optimize,
+            TokenType.PRAGMA_SIMD: self.parse_pragma_simd,
+            TokenType.PRAGMA_UNROLL: self.parse_pragma_unroll,
+            TokenType.KW_IMPORT: self.parse_import,
+            TokenType.KW_EXPORT: self.parse_export,
+            TokenType.KW_MODULE: self.parse_module,
+            TokenType.KW_LET: self.parse_let,
+            TokenType.KW_CONST: self.parse_var_decl,
+            TokenType.KW_FN: self.parse_function,
+            TokenType.KW_DEF: self.parse_function,
+            TokenType.KW_CLASS: self.parse_class,
+            TokenType.KW_STRUCT: self.parse_struct,
+            TokenType.KW_ENUM: self.parse_enum,
+            TokenType.KW_IMPL: self.parse_impl,
+            TokenType.KW_TEMPLATE: self.parse_template,
+            TokenType.KW_IF: self.parse_if,
+            TokenType.KW_WHILE: self.parse_while,
+            TokenType.KW_FOR: self.parse_for,
+            TokenType.KW_RETURN: self.parse_return,
+            TokenType.KW_SWITCH: self.parse_switch,
+            TokenType.KW_CASE: self.parse_case,
+            TokenType.KW_DEFAULT: self.parse_case,
+            TokenType.KW_BREAK: self.parse_break_continue,
+            TokenType.KW_CONTINUE: self.parse_break_continue,
+            TokenType.KW_DATA_SECTION: self.parse_data_section,
+            TokenType.KW_WITH: self.parse_with,
+            TokenType.KW_BLOCK_ARRAY: self.parse_block_array,
+            TokenType.KW_ASM: self.parse_asm_statement,
+            TokenType.OP_LBRACE: self.parse_block,
+        }
+        handler = dispatch.get(tok.type)
+        if handler:
+            return handler()
+
+        return self.parse_expression_statement()
+
+    def parse_expression_statement(self) -> Optional[ASTNode]:
+        expr = self.parse_expression()
+        if expr is None:
+            return None
+        assign_ops = {
+            TokenType.OP_ASSIGN: "=",
+            TokenType.OP_PLUS_ASSIGN: "+=",
+            TokenType.OP_MINUS_ASSIGN: "-=",
+            TokenType.OP_MULTIPLY_ASSIGN: "*=",
+            TokenType.OP_DIVIDE_ASSIGN: "/=",
+        }
+        if self.current().type in assign_ops:
+            op_tok = self.current()
             self.advance()
-            
-        self.match(TokenType.OP_SEMICOLON)
-        return node
-        
-    def parse_module(self) -> Optional[ASTNode]:
-        node = ASTNode(ASTType.MODULE, line=self.current().line, column=self.current().column)
-        self.advance()
-        
-        if self.current().type == TokenType.TOK_IDENTIFIER:
-            node.value = self.current().value
-            self.advance()
-            
-        self.parse_indented_block(node)
-        return node
-        
-    def parse_block_array(self) -> Optional[ASTNode]:
-        node = ASTNode(ASTType.BLOCK_ARRAY_TYPE, line=self.current().line, column=self.current().column)
-        self.advance()
-        
-        if self.match(TokenType.OP_LPAREN):
-            if self.current().type in [TokenType.KW_F32, TokenType.KW_F64]:
-                dtype = self.parse_type()
-                node.block_array_type = dtype
-            if self.match(TokenType.OP_COMMA):
-                if self.current().type == TokenType.TOK_NUMBER:
-                    node.block_size = int(self.current().value)
-                    self.advance()
-            self.expect(TokenType.OP_RPAREN, "Expected ')'")
-        
-        if self.match(TokenType.OP_ASSIGN):
+            node = ASTNode(ASTType.ASSIGN, assign_ops[op_tok.type], op_tok.line, op_tok.column)
+            node.add_child(expr)
             node.add_child(self.parse_expression())
-        
+            node.meta['is_declaration'] = False
+            self.match(TokenType.OP_SEMICOLON)
+            return node
+        self.match(TokenType.OP_SEMICOLON)
+        return expr
+
+    def parse_break_continue(self) -> ASTNode:
+        tok = self.current()
+        self.advance()
+        node = ASTNode(ASTType.BREAK_STMT if tok.type == TokenType.KW_BREAK else ASTType.CONTINUE_STMT,
+                       tok.value, tok.line, tok.column)
         self.match(TokenType.OP_SEMICOLON)
         return node
-        
+
     def parse_indented_block(self, node: ASTNode) -> None:
         while self.current().type == TokenType.NEWLINE:
             self.advance()
         if self.current().type == TokenType.INDENT:
             self.advance()
-            while self.current().type != TokenType.DEDENT and self.current().type != TokenType.TOK_EOF:
+            while self.current().type not in (TokenType.DEDENT, TokenType.TOK_EOF):
+                before = self.pos
                 stmt = self.parse_statement()
                 if stmt:
                     node.add_child(stmt)
-                else:
-                    break
+                if self.pos == before:
+                    self.advance()
             self.match(TokenType.DEDENT)
-        
-    def parse_template(self) -> Optional[ASTNode]:
-        node = ASTNode(ASTType.TEMPLATE_DECL, line=self.current().line, column=self.current().column)
-        
-        if not self.expect(TokenType.KW_TEMPLATE, "Expected 'template'"):
-            return None
-        if not self.expect(TokenType.OP_TEMPLATE_LT, "Expected '<'"):
-            return None
-            
-        while self.current().type == TokenType.KW_CLASS or self.current().type == TokenType.TOK_IDENTIFIER:
-            if self.current().type == TokenType.KW_CLASS:
+
+    def parse_inline_block(self, node: ASTNode) -> None:
+        """Statements on the same line after ':' (e.g. switch cases)."""
+        while self.current().type not in (TokenType.NEWLINE, TokenType.DEDENT, TokenType.TOK_EOF):
+            before = self.pos
+            stmt = self.parse_statement()
+            if stmt:
+                node.add_child(stmt)
+            if self.pos == before:
                 self.advance()
-            param_name = self.current().value
+        self.match(TokenType.NEWLINE)
+
+    # -- types --------------------------------------------------------------
+    def parse_type_ref(self) -> TypeRef:
+        tok = self.current()
+
+        if tok.type == TokenType.OP_BIT_AND:
             self.advance()
-            node.template_params.append(param_name)
-            if not self.match(TokenType.OP_COMMA):
-                break
-                
-        if not self.expect(TokenType.OP_TEMPLATE_GT, "Expected '>'"):
-            return None
-            
-        if self.current().type == TokenType.KW_CLASS:
-            class_node = self.parse_class()
-            class_node.template_params = node.template_params
-            node.add_child(class_node)
-            
-        return node
-        
-    def parse_class(self) -> Optional[ASTNode]:
-        node = ASTNode(ASTType.CLASS, line=self.current().line, column=self.current().column)
-        node.attributes = self.current_attributes.copy()
-        
-        if not self.expect(TokenType.KW_CLASS, "Expected 'class'"):
-            return None
-            
-        class_name = self.current().value
-        if not self.expect(TokenType.TOK_IDENTIFIER, "Expected class name"):
-            return None
-        node.value = class_name
-        
-        if self.current().type == TokenType.OP_TEMPLATE_LT:
+            is_mut = self.match(TokenType.KW_MUT)
+            inner = self.parse_type_ref()
+            inner.is_ref = True
+            inner.is_mut = inner.is_mut or is_mut
+            return inner
+
+        if tok.type in (TokenType.KW_FN, TokenType.KW_DEF):
             self.advance()
-            while self.current().type == TokenType.TOK_IDENTIFIER:
-                node.template_params.append(self.current().value)
-                self.advance()
+            ref = TypeRef(base=DataType.FN)
+            if self.match(TokenType.OP_LPAREN):
+                while self.current().type not in (TokenType.OP_RPAREN, TokenType.TOK_EOF):
+                    ref.fn_params.append(self.parse_type_ref())
+                    if not self.match(TokenType.OP_COMMA):
+                        break
+                self.expect(TokenType.OP_RPAREN, "Expected ')' in function type")
+            if self.match(TokenType.OP_ARROW):
+                ref.fn_return = self.parse_type_ref()
+            return ref
+
+        if tok.type == TokenType.OP_LPAREN:
+            self.advance()
+            ref = TypeRef(base=DataType.TUPLE)
+            while self.current().type not in (TokenType.OP_RPAREN, TokenType.TOK_EOF):
+                ref.params.append(self.parse_type_ref())
                 if not self.match(TokenType.OP_COMMA):
                     break
-            self.expect(TokenType.OP_TEMPLATE_GT, "Expected '>'")
-            
-        if self.current().type == TokenType.KW_EXTENDS:
+            self.expect(TokenType.OP_RPAREN, "Expected ')' in tuple type")
+            return ref
+
+        name = tok.value
+        self.advance()
+
+        if name in PRIMITIVE_TYPES:
+            ref = TypeRef(base=PRIMITIVE_TYPES[name], name=name)
+            if self.at_generic_open():
+                self.advance()
+                while not self.at_generic_close() and self.current().type != TokenType.TOK_EOF:
+                    self.advance()
+                self.expect_generic_close("Expected '>'")
+            return ref
+
+        if name in ('ptr', 'ptr_mut', 'mmio_ptr'):
+            ref = TypeRef(base={'ptr': DataType.PTR, 'ptr_mut': DataType.PTR_MUT,
+                                'mmio_ptr': DataType.MMIO_PTR}[name], name=name)
+            if self.at_generic_open():
+                self.advance()
+                if not self.at_generic_close():
+                    ref.elem = self.parse_type_ref()
+                self.expect_generic_close("Expected '>'")
+            return ref
+
+        if name in ('array', 'Array'):
+            ref = TypeRef(base=DataType.ARRAY, name='array')
+            if self.at_generic_open():
+                self.advance()
+                ref.elem = self.parse_type_ref()
+                if self.match(TokenType.OP_COMMA):
+                    if self.current().type in (TokenType.TOK_NUMBER, TokenType.TOK_HEX):
+                        try:
+                            ref.length = int(self.current().value, 0)
+                        except ValueError:
+                            ref.length = 0
+                        self.advance()
+                    elif self.current().type == TokenType.TOK_IDENTIFIER:
+                        self.advance()
+                self.expect_generic_close("Expected '>'")
+            return ref
+
+        if name == 'Option':
+            ref = TypeRef(base=DataType.OPTION, name='Option')
+            if self.at_generic_open():
+                self.advance()
+                ref.elem = self.parse_type_ref()
+                self.expect_generic_close("Expected '>'")
+            return ref
+
+        if name in ('BlockArray', 'block_array'):
+            ref = TypeRef(base=DataType.BLOCK_ARRAY, name='BlockArray')
+            if self.at_generic_open():
+                self.advance()
+                ref.elem = self.parse_type_ref()
+                self.expect_generic_close("Expected '>'")
+            return ref
+
+        ref = TypeRef(base=DataType.STRUCT, name=name)
+        if self.at_generic_open():
             self.advance()
-            base_name = self.current().value
+            while not self.at_generic_close() and self.current().type != TokenType.TOK_EOF:
+                ref.params.append(self.parse_type_ref())
+                if not self.match(TokenType.OP_COMMA):
+                    break
+            self.expect_generic_close("Expected '>'")
+        if name in self.known_types:
+            known = self.known_types[name]
+            return TypeRef(base=known.base, name=name, elem=known.elem, length=known.length,
+                           params=ref.params)
+        return ref
+
+    def parse_type(self) -> DataType:
+        return self.parse_type_ref().base
+
+    def parse_type_conversion(self, obj: ASTNode) -> ASTNode:
+        node = ASTNode(ASTType.TYPE_CONVERSION, "as", obj.line, obj.column)
+        node.add_child(obj)
+        target = self.parse_type_ref()
+        node.target_type = target.base
+        node.meta['target_ref'] = target
+        if self.current().type == TokenType.OP_DOT:
             self.advance()
-            node.add_child(ASTNode(ASTType.VARIABLE, base_name, node.line, node.column))
-            
-        if not self.expect(TokenType.OP_COLON, "Expected ':'"):
-            return None
-            
-        self.symbols.enter_scope()
-        self.parse_indented_block(node)
-        self.symbols.exit_scope()
-        
-        self.symbols.declare(class_name, DataType.RECORD, node.line, node.column, True, attributes=node.attributes)
+            if self.current().value:
+                node.conversion_method = self.current().value
+                self.advance()
+                if self.current().type == TokenType.OP_LPAREN:
+                    self.advance()
+                    self.expect(TokenType.OP_RPAREN, "Expected ')'")
         return node
-        
-    def parse_function(self) -> Optional[ASTNode]:
+
+    # -- variable declarations ---------------------------------------------
+    def _declare_local(self, name: str, ref: TypeRef, line: int, column: int,
+                       is_global: bool = False, is_static: bool = False) -> None:
+        is_global = is_global or is_static or self.symbols.current_scope == 0
+        self.symbols.declare(name, ref.base, line, column, is_global,
+                             is_block_array=(ref.base == DataType.BLOCK_ARRAY),
+                             block_array_type=ref.elem.base if ref.elem else None,
+                             type_ref=ref)
+        sym = self.symbols.lookup(name)
+        if sym is not None:
+            sym.type_ref = ref
+
+    def parse_let(self, consume_semicolon: bool = True) -> Optional[ASTNode]:
+        tok = self.current()
+        if not self.expect(TokenType.KW_LET, "Expected 'let'"):
+            return None
+        is_mut = self.match(TokenType.KW_MUT)
+
+        if self.current().type == TokenType.OP_LPAREN:
+            self.advance()
+            names = []
+            while self.current().type not in (TokenType.OP_RPAREN, TokenType.TOK_EOF):
+                if self.current().type == TokenType.TOK_IDENTIFIER:
+                    names.append(self.current().value)
+                    self.advance()
+                if not self.match(TokenType.OP_COMMA):
+                    break
+            self.expect(TokenType.OP_RPAREN, "Expected ')' in destructuring pattern")
+            node = ASTNode(ASTType.ASSIGN, "=", tok.line, tok.column)
+            node.meta['is_declaration'] = True
+            node.meta['tuple_names'] = names
+            node.meta['is_mut'] = is_mut
+            for name in names:
+                self._declare_local(name, TypeRef(base=DataType.U64), tok.line, tok.column)
+            if self.match(TokenType.OP_ASSIGN):
+                node.add_child(self.parse_expression())
+            if consume_semicolon:
+                self.match(TokenType.OP_SEMICOLON)
+            return node
+
+        name_tok = self.current()
+        if not self.is_name_token(name_tok):
+            self.error("Expected variable name")
+            self.skip_to_line_end()
+            return None
+        name = name_tok.value
+        self.advance()
+
+        node = ASTNode(ASTType.ASSIGN, "=", tok.line, tok.column)
+        node.meta['is_declaration'] = True
+        node.meta['is_mut'] = is_mut
+
+        ref = None
+        if self.match(TokenType.OP_COLON):
+            ref = self.parse_type_ref()
+
+        value = None
+        if self.match(TokenType.OP_ASSIGN):
+            value = self.parse_expression()
+
+        if ref is None:
+            ref = self._infer_ref(value)
+
+        node.meta['type_ref'] = ref
+        var_node = ASTNode(ASTType.VARIABLE, name, tok.line, tok.column)
+        var_node.meta['type_ref'] = ref
+        node.add_child(var_node)
+        if value is not None:
+            node.add_child(value)
+
+        self._declare_local(name, ref, tok.line, tok.column)
+        self._stamp_var(var_node, name)
+        if consume_semicolon:
+            self.match(TokenType.OP_SEMICOLON)
+        return node
+
+    def parse_var_decl(self, is_static: bool = False) -> Optional[ASTNode]:
+        tok = self.current()
+        is_const = tok.type == TokenType.KW_CONST
+        if is_static:
+            if not self.expect(TokenType.KW_STATIC, "Expected 'static'"):
+                return None
+        elif is_const:
+            if not self.expect(TokenType.KW_CONST, "Expected 'const'"):
+                return None
+        else:
+            self.error("Expected 'static' or 'const'")
+            return None
+
+        name_tok = self.current()
+        if not self.is_name_token(name_tok):
+            self.error("Expected variable name")
+            self.skip_to_line_end()
+            return None
+        self.advance()
+
+        node = ASTNode(ASTType.ASSIGN, "=", tok.line, tok.column)
+        node.meta['is_declaration'] = True
+        node.meta['is_static'] = True
+        node.meta['is_const'] = is_const
+
+        ref = None
+        if self.match(TokenType.OP_COLON):
+            ref = self.parse_type_ref()
+
+        value = None
+        if self.match(TokenType.OP_ASSIGN):
+            value = self.parse_expression()
+
+        if ref is None:
+            ref = self._infer_ref(value)
+        node.meta['type_ref'] = ref
+
+        var_node = ASTNode(ASTType.VARIABLE, name_tok.value, tok.line, tok.column)
+        var_node.meta['type_ref'] = ref
+        node.add_child(var_node)
+        if value is not None:
+            node.add_child(value)
+
+        self._declare_local(name_tok.value, ref, tok.line, tok.column, is_global=True)
+        self._stamp_var(var_node, name_tok.value)
+        self.match(TokenType.OP_SEMICOLON)
+        return node
+
+    def _stamp_var(self, node: ASTNode, name: str) -> ASTNode:
+        sym = self.symbols.lookup(name)
+        if sym is not None:
+            node.meta['offset'] = sym.stack_offset
+            node.meta['is_global'] = sym.is_global
+            if sym.type_ref is not None:
+                node.meta.setdefault('type_ref', sym.type_ref)
+        return node
+
+    def _infer_ref(self, value: Optional[ASTNode]) -> TypeRef:
+        if value is None:
+            return TypeRef(base=DataType.U64)
+        if value.type == ASTType.LITERAL:
+            if value.data_type == DataType.F64:
+                return TypeRef(base=DataType.F64)
+            if value.data_type == DataType.CHAR and value.meta.get('is_string'):
+                return TypeRef(base=DataType.STRING)
+            if value.data_type == DataType.CHAR:
+                return TypeRef(base=DataType.CHAR)
+            if value.data_type == DataType.BOOL:
+                return TypeRef(base=DataType.BOOL)
+            return TypeRef(base=DataType.U64)
+        if value.type == ASTType.ARRAY_LITERAL:
+            elem = self._infer_ref(value.children[0]) if value.children else TypeRef(base=DataType.U64)
+            return TypeRef(base=DataType.ARRAY, elem=elem,
+                           length=len(value.children) or value.meta.get('repeat', 0))
+        if value.type == ASTType.STRUCT_LITERAL:
+            return TypeRef(base=DataType.STRUCT, name=value.value)
+        if value.type == ASTType.LAMBDA:
+            return TypeRef(base=DataType.FN)
+        if value.type in (ASTType.CALL, ASTType.METHOD_CALL):
+            ret = value.meta.get('return_ref')
+            if isinstance(ret, TypeRef):
+                return ret
+        if value.type == ASTType.TYPE_CONVERSION:
+            return value.meta.get('target_ref') or TypeRef(base=value.target_type)
+        if value.type == ASTType.VARIABLE:
+            sym = self.symbols.lookup(value.value)
+            if sym is not None and sym.type_ref is not None:
+                return sym.type_ref
+        if value.type == ASTType.BINARY_OP and value.value in ('+', '-', '*', '/', '%'):
+            return self._infer_ref(value.children[0])
+        return TypeRef(base=DataType.U64)
+
+    # -- functions ----------------------------------------------------------
+    def parse_function(self, modifiers: Optional[List[str]] = None) -> Optional[ASTNode]:
         node = ASTNode(ASTType.FUNCTION, line=self.current().line, column=self.current().column)
         node.optimization_level = self.current_opt_level
         node.simd_level = self.current_simd_level
         node.attributes = self.current_attributes.copy()
-        
-        if self.current().type == TokenType.KW_DEF:
-            self.advance()
-        else:
-            self.expect(TokenType.KW_FN, "Expected 'fn'")
-            
-        func_name = self.current().value
-        if not self.expect(TokenType.TOK_IDENTIFIER, "Expected function name"):
+        node.meta['modifiers'] = list(modifiers or [])
+        node.meta['visibility'] = self.current_visibility
+        node.meta['parent'] = self.current_class
+
+        if not self.match_any(TokenType.KW_FN, TokenType.KW_DEF):
+            self.error("Expected 'fn'")
             return None
-        node.value = func_name
-        
-        if self.current().type == TokenType.OP_TEMPLATE_LT:
+
+        name_tok = self.current()
+        if name_tok.type != TokenType.TOK_IDENTIFIER and name_tok.value not in SOFT_KEYWORD_NAMES:
+            self.error("Expected function name")
+            self.skip_to_line_end()
+            return None
+        self.advance()
+        node.value = name_tok.value
+
+        if self.at_generic_open():
             self.advance()
-            while self.current().type == TokenType.TOK_IDENTIFIER:
-                node.template_params.append(self.current().value)
+            while not self.at_generic_close() and self.current().type != TokenType.TOK_EOF:
+                if self.current().value in ('class', 'typename'):
+                    self.advance()
+                    continue
+                if self.current().type == TokenType.TOK_IDENTIFIER:
+                    node.template_params.append(self.current().value)
                 self.advance()
-                if not self.match(TokenType.OP_COMMA):
-                    break
-            self.expect(TokenType.OP_TEMPLATE_GT, "Expected '>'")
-            
-        self.expect(TokenType.OP_LPAREN, "Expected '('")
-        
-        param_names = []
-        param_types = []
-        while self.current().type == TokenType.TOK_IDENTIFIER:
-            param_name = self.current().value
+            self.expect_generic_close("Expected '>'")
+
+        if not self.expect(TokenType.OP_LPAREN, "Expected '('"):
+            self.skip_to_line_end()
+            return None
+
+        param_names: List[str] = []
+        param_refs: List[TypeRef] = []
+        param_defaults: List[Optional[ASTNode]] = []
+        self_mode = ""
+
+        while self.current().type not in (TokenType.OP_RPAREN, TokenType.TOK_EOF):
+            if self.current().type in (TokenType.OP_BIT_AND, TokenType.KW_MUT, TokenType.KW_SELF):
+                is_ref = self.match(TokenType.OP_BIT_AND)
+                is_mut = self.match(TokenType.KW_MUT)
+                if self.current().type == TokenType.KW_SELF:
+                    self.advance()
+                    self_mode = ('ref_mut' if is_mut else 'ref') if is_ref else ('mut' if is_mut else 'value')
+                    param_names.append('self')
+                    param_refs.append(TypeRef(base=DataType.PTR if is_ref else DataType.STRUCT,
+                                              name=self.current_class, is_ref=is_ref, is_mut=is_mut))
+                    param_defaults.append(None)
+                    if not self.match(TokenType.OP_COMMA):
+                        break
+                    continue
+
+            pname_tok = self.current()
+            if pname_tok.type != TokenType.TOK_IDENTIFIER:
+                self.error("Expected parameter name")
+                self.advance()
+                break
             self.advance()
-            param_names.append(param_name)
+            param_names.append(pname_tok.value)
+
             if self.match(TokenType.OP_COLON):
-                param_types.append(self.parse_type())
+                pref = self.parse_type_ref()
             else:
-                param_types.append(DataType.U64)
+                pref = TypeRef(base=DataType.U64)
+            param_refs.append(pref)
+            param_defaults.append(None)
+
+            if self.match(TokenType.OP_ASSIGN):
+                param_defaults[-1] = self.parse_expression()
             if not self.match(TokenType.OP_COMMA):
                 break
-                
+
         self.expect(TokenType.OP_RPAREN, "Expected ')'")
-        
-        node.function_params = param_types
-        node.function_param_names = param_names
-        
+
+        ret_ref = TypeRef(base=DataType.VOID)
         if self.match(TokenType.OP_ARROW):
-            node.function_return = self.parse_type()
-            
+            ret_ref = self.parse_type_ref()
+
+        # instance methods always take the receiver as their first argument,
+        # even when the signature leaves it implicit (`fn speak():`)
+        mods = node.meta.get('modifiers') or []
+        if self.current_class and 'self' not in param_names and 'static' not in mods:
+            param_names.insert(0, 'self')
+            param_refs.insert(0, TypeRef(base=DataType.PTR, name=self.current_class, is_ref=True))
+            param_defaults.insert(0, None)
+            self_mode = self_mode or 'ref'
+
+        node.function_params = [p.base for p in param_refs]
+        node.function_param_names = param_names
+        node.function_return = ret_ref.base
+        node.meta['param_refs'] = param_refs
+        node.meta['param_defaults'] = param_defaults
+        node.meta['return_ref'] = ret_ref
+        node.meta['self_mode'] = self_mode
+
+        self.symbols.register_function(node.value, node)
+
+        has_body = self.current().type == TokenType.OP_COLON
         self.symbols.reset_frame()
         self.symbols.enter_scope()
-        
-        for i, (name, ptype) in enumerate(zip(param_names, param_types)):
-            self.symbols.declare(name, ptype, node.line, node.column, False)
-            
-        if self.match(TokenType.OP_COLON):
-            while self.current().type == TokenType.NEWLINE:
-                self.advance()
-            if self.current().type == TokenType.INDENT:
-                self.advance()
-                while self.current().type != TokenType.DEDENT and self.current().type != TokenType.TOK_EOF:
-                    stmt = self.parse_statement()
-                    if stmt:
-                        node.add_child(stmt)
-                    else:
-                        break
-                self.match(TokenType.DEDENT)
-        
+        for pname, pref in zip(param_names, param_refs):
+            self.symbols.declare(pname, pref.base, node.line, node.column, False)
+            sym = self.symbols.lookup(pname)
+            if sym is not None:
+                sym.type_ref = pref
+
+        if has_body:
+            self.advance()
+            self.parse_indented_block(node)
+        elif self.current().type not in (TokenType.NEWLINE, TokenType.DEDENT, TokenType.TOK_EOF):
+            self.skip_to_line_end()
+
+        node.meta['param_offsets'] = [
+            (self.symbols.lookup(pname).stack_offset if self.symbols.lookup(pname) else -(8 * (i + 1)))
+            for i, pname in enumerate(param_names)]
         node.function_frame_size = self.symbols.get_frame_size()
+        node.meta['frame_size'] = node.function_frame_size
         self.symbols.exit_scope()
         return node
-        
-    def parse_type(self) -> DataType:
+
+    # -- aggregate types ----------------------------------------------------
+    def parse_struct(self, modifiers: Optional[List[str]] = None) -> Optional[ASTNode]:
         tok = self.current()
-        type_map = {
-            'u8': DataType.U8, 'u16': DataType.U16, 'u32': DataType.U32, 'u64': DataType.U64,
-            'i8': DataType.I8, 'i16': DataType.I16, 'i32': DataType.I32, 'i64': DataType.I64,
-            'f32': DataType.F32, 'f64': DataType.F64, 'bool': DataType.BOOL, 'char': DataType.CHAR,
-            'bit': DataType.BIT, 'ptr': DataType.PTR, 'mmio_ptr': DataType.MMIO_PTR,
-            'block_array': DataType.BLOCK_ARRAY,
-            'Option': DataType.OPTION,
-            'vec4_f32': DataType.VEC4_F32, 'vec8_f32': DataType.VEC8_F32, 'vec16_f32': DataType.VEC16_F32,
-        }
-        if tok.value in type_map:
-            self.advance()
-            if self.current().type == TokenType.OP_TEMPLATE_LT:
-                self.advance()
-                while self.current().type != TokenType.OP_TEMPLATE_GT and self.current().type != TokenType.TOK_EOF:
-                    self.advance()
-                self.expect(TokenType.OP_TEMPLATE_GT, "Expected '>'")
-            return type_map[tok.value]
+        if not self.expect(TokenType.KW_STRUCT, "Expected 'struct'"):
+            return None
+        name_tok = self.current()
+        if name_tok.type != TokenType.TOK_IDENTIFIER:
+            self.error("Expected struct name")
+            self.skip_to_line_end()
+            return None
         self.advance()
-        return DataType.U64
-        
-    def parse_type_conversion(self, obj: ASTNode) -> ASTNode:
-        node = ASTNode(ASTType.TYPE_CONVERSION, ":", obj.line, obj.column)
-        node.add_child(obj)
-        
-        target_type = self.parse_type()
-        node.target_type = target_type
-        
-        if self.current().type == TokenType.OP_DOT:
+
+        node = ASTNode(ASTType.STRUCT_DEF, name_tok.value, tok.line, tok.column)
+        node.attributes = self.current_attributes.copy()
+        node.meta['modifiers'] = list(modifiers or [])
+
+        if self.at_generic_open():
             self.advance()
-            if self.current().type == TokenType.TOK_IDENTIFIER:
-                node.conversion_method = self.current().value
+            while not self.at_generic_close() and self.current().type != TokenType.TOK_EOF:
+                if self.current().type == TokenType.TOK_IDENTIFIER:
+                    node.template_params.append(self.current().value)
                 self.advance()
-        
+            self.expect_generic_close("Expected '>'")
+
+        self.expect(TokenType.OP_COLON, "Expected ':' after struct name")
+
+        self.known_types[name_tok.value] = TypeRef(base=DataType.STRUCT, name=name_tok.value)
+        outer_class = self.current_class
+        self.current_class = name_tok.value
+        fields: List[Tuple[str, TypeRef]] = []
+        methods: List[ASTNode] = []
+
+        self.symbols.enter_scope()
+        self._parse_aggregate_body(fields, methods)
+        self.symbols.exit_scope()
+        self.current_class = outer_class
+
+        node.record_fields = [(fname, fref.base) for fname, fref in fields]
+        node.meta['field_refs'] = fields
+        node.meta['methods'] = methods
+        for m in methods:
+            node.add_child(m)
+
+        self.symbols.define_struct(name_tok.value, fields)
         return node
-        
-    def parse_let(self) -> Optional[ASTNode]:
-        node = ASTNode(ASTType.ASSIGN, line=self.current().line, column=self.current().column)
-        
-        if not self.expect(TokenType.KW_LET, "Expected 'let'"):
-            return None
-            
-        var_name = self.current().value
-        if not self.expect(TokenType.TOK_IDENTIFIER, "Expected variable name"):
-            return None
-            
-        var_type = DataType.U64
-        is_block_array = False
-        block_array_type = None
-        
-        if self.current().type == TokenType.OP_COLON:
+
+    def _parse_aggregate_body(self, fields: List[Tuple[str, TypeRef]], methods: List[ASTNode]) -> None:
+        while self.current().type == TokenType.NEWLINE:
             self.advance()
-            if self.current().type == TokenType.KW_BLOCK_ARRAY:
+        if self.current().type == TokenType.INDENT:
+            self.advance()
+            while self.current().type not in (TokenType.DEDENT, TokenType.TOK_EOF):
+                before = self.pos
+                tok = self.current()
+                if tok.type in (TokenType.KW_PRIVATE, TokenType.KW_PUBLIC, TokenType.KW_PROTECTED) \
+                        and self.peek().type == TokenType.OP_COLON:
+                    self.current_visibility = self.MODIFIER_TOKENS[tok.type]
+                    self.advance()
+                    self.advance()
+                    if self.current().type == TokenType.NEWLINE:
+                        self.advance()
+                        if self.current().type == TokenType.INDENT:
+                            self.advance()
+                            while self.current().type not in (TokenType.DEDENT, TokenType.TOK_EOF):
+                                inner_before = self.pos
+                                self._parse_member(fields, methods)
+                                if self.pos == inner_before:
+                                    self.advance()
+                            self.match(TokenType.DEDENT)
+                    continue
+                self._parse_member(fields, methods)
+                if self.pos == before:
+                    self.advance()
+            self.match(TokenType.DEDENT)
+
+    def _parse_member(self, fields: List[Tuple[str, TypeRef]], methods: List[ASTNode]) -> None:
+        tok = self.current()
+        if tok.type in (TokenType.NEWLINE, TokenType.INDENT):
+            self.advance()
+            return
+        if tok.type in (TokenType.KW_FN, TokenType.KW_DEF) or tok.type in self.MODIFIER_TOKENS:
+            mods = []
+            while self.current().type in self.MODIFIER_TOKENS:
+                mods.append(self.MODIFIER_TOKENS[self.current().type])
                 self.advance()
-                var_type = DataType.BLOCK_ARRAY
-                is_block_array = True
-                if self.match(TokenType.OP_LPAREN):
-                    block_array_type = self.parse_type()
-                    self.expect(TokenType.OP_RPAREN, "Expected ')'")
+            if self.current().type in (TokenType.KW_FN, TokenType.KW_DEF):
+                fn = self.parse_function(mods)
+                if fn:
+                    methods.append(fn)
             else:
-                var_type = self.parse_type()
-            
-        is_global = (self.symbols.current_scope == 0)
-        self.symbols.declare(var_name, var_type, node.line, node.column, is_global, is_block_array, block_array_type)
-        
-        var_child = ASTNode(ASTType.VARIABLE, var_name, node.line, node.column)
-        node.add_child(var_child)
-        
-        if self.match(TokenType.OP_ASSIGN):
-            node.add_child(self.parse_expression())
-        else:
-            node.add_child(ASTNode(ASTType.LITERAL, "0", node.line, node.column))
-            
-        self.match(TokenType.OP_SEMICOLON)
+                self.error("Expected method declaration")
+                self.skip_to_line_end()
+            return
+        if tok.type == TokenType.KW_STATIC:
+            self.advance()
+            if self.current().type in (TokenType.KW_FN, TokenType.KW_DEF):
+                fn = self.parse_function(["static"])
+                if fn:
+                    methods.append(fn)
+                return
+            self.error("Expected 'fn' after 'static'")
+            self.skip_to_line_end()
+            return
+        if tok.type == TokenType.TOK_IDENTIFIER:
+            name = tok.value
+            self.advance()
+            if self.match(TokenType.OP_COLON):
+                ref = self.parse_type_ref()
+                if self.match(TokenType.OP_ASSIGN):
+                    self.parse_expression()
+                fields.append((name, ref))
+                self.match(TokenType.OP_SEMICOLON)
+                return
+            self.error("Expected ':' after field name")
+            self.skip_to_line_end()
+            return
+        self.skip_to_line_end()
+
+    def parse_class(self, modifiers: Optional[List[str]] = None) -> Optional[ASTNode]:
+        tok = self.current()
+        if not self.expect(TokenType.KW_CLASS, "Expected 'class'"):
+            return None
+        name_tok = self.current()
+        if name_tok.type != TokenType.TOK_IDENTIFIER:
+            self.error("Expected class name")
+            self.skip_to_line_end()
+            return None
+        self.advance()
+
+        node = ASTNode(ASTType.CLASS, name_tok.value, tok.line, tok.column)
+        node.attributes = self.current_attributes.copy()
+        node.meta['modifiers'] = list(modifiers or [])
+
+        if self.at_generic_open():
+            self.advance()
+            while not self.at_generic_close() and self.current().type != TokenType.TOK_EOF:
+                if self.current().type == TokenType.TOK_IDENTIFIER:
+                    node.template_params.append(self.current().value)
+                self.advance()
+            self.expect_generic_close("Expected '>'")
+
+        if self.match(TokenType.KW_EXTENDS):
+            if self.current().type == TokenType.TOK_IDENTIFIER:
+                node.meta['base_class'] = self.current().value
+                self.advance()
+
+        if not self.expect(TokenType.OP_COLON, "Expected ':' after class name"):
+            self.skip_to_line_end()
+
+        self.known_types[name_tok.value] = TypeRef(base=DataType.STRUCT, name=name_tok.value)
+        outer_class = self.current_class
+        self.current_class = name_tok.value
+        fields: List[Tuple[str, TypeRef]] = []
+        methods: List[ASTNode] = []
+
+        self.symbols.enter_scope()
+        self._parse_aggregate_body(fields, methods)
+        self.symbols.exit_scope()
+        self.current_class = outer_class
+
+        node.record_fields = [(fname, fref.base) for fname, fref in fields]
+        node.meta['field_refs'] = fields
+        node.meta['methods'] = methods
+        for m in methods:
+            node.add_child(m)
+
+        self.symbols.define_struct(name_tok.value, fields)
         return node
-        
+
+    def parse_enum(self) -> Optional[ASTNode]:
+        tok = self.current()
+        self.expect(TokenType.KW_ENUM, "Expected 'enum'")
+        name_tok = self.current()
+        name = name_tok.value if name_tok.type == TokenType.TOK_IDENTIFIER else "enum"
+        self.advance()
+        node = ASTNode(ASTType.ENUM_DEF, name, tok.line, tok.column)
+        self.expect(TokenType.OP_COLON, "Expected ':' after enum name")
+        self.parse_indented_block(node)
+        self.known_types[name] = TypeRef(base=DataType.STRUCT, name=name)
+        return node
+
+    def parse_impl(self) -> Optional[ASTNode]:
+        tok = self.current()
+        if not self.expect(TokenType.KW_IMPL, "Expected 'impl'"):
+            return None
+        node = ASTNode(ASTType.IMPL_BLOCK, "", tok.line, tok.column)
+
+        if self.at_generic_open():
+            self.advance()
+            while not self.at_generic_close() and self.current().type != TokenType.TOK_EOF:
+                if self.current().type == TokenType.TOK_IDENTIFIER:
+                    node.template_params.append(self.current().value)
+                self.advance()
+            self.expect_generic_close("Expected '>'")
+
+        if self.current().type == TokenType.TOK_IDENTIFIER:
+            node.value = self.current().value
+            self.advance()
+            if self.at_generic_open():
+                self.advance()
+                while not self.at_generic_close() and self.current().type != TokenType.TOK_EOF:
+                    self.advance()
+                self.expect_generic_close("Expected '>'")
+
+        self.expect(TokenType.OP_COLON, "Expected ':' after impl target")
+
+        outer_class = self.current_class
+        self.current_class = node.value
+        self.symbols.enter_scope()
+        self.parse_indented_block(node)
+        self.symbols.exit_scope()
+        self.current_class = outer_class
+        return node
+
+    def parse_template(self) -> Optional[ASTNode]:
+        tok = self.current()
+        if not self.expect(TokenType.KW_TEMPLATE, "Expected 'template'"):
+            return None
+        node = ASTNode(ASTType.TEMPLATE_DECL, "", tok.line, tok.column)
+        if not self.expect_generic_open("Expected '<'"):
+            return None
+        while not self.at_generic_close() and self.current().type != TokenType.TOK_EOF:
+            if self.current().value in ('class', 'typename'):
+                self.advance()
+                continue
+            if self.current().type == TokenType.TOK_IDENTIFIER:
+                node.template_params.append(self.current().value)
+            self.advance()
+            self.match(TokenType.OP_COMMA)
+        self.expect_generic_close("Expected '>'")
+
+        inner = None
+        if self.current().type == TokenType.KW_CLASS:
+            inner = self.parse_class()
+        elif self.current().type == TokenType.KW_STRUCT:
+            inner = self.parse_struct()
+        elif self.current().type in (TokenType.KW_FN, TokenType.KW_DEF):
+            inner = self.parse_function()
+        elif self.current().type == TokenType.KW_IMPL:
+            inner = self.parse_impl()
+        if inner is not None:
+            inner.template_params = node.template_params
+            node.add_child(inner)
+            node.value = inner.value
+        return node
+
+    # -- control flow -------------------------------------------------------
+    def _parse_condition(self) -> Optional[ASTNode]:
+        if self.match(TokenType.OP_LPAREN):
+            cond = self.parse_expression()
+            self.expect(TokenType.OP_RPAREN, "Expected ')'")
+            return cond
+        return self.parse_expression()
+
+    def parse_if(self) -> Optional[ASTNode]:
+        tok = self.current()
+        node = ASTNode(ASTType.IF_STMT, line=tok.line, column=tok.column)
+        if not self.match_any(TokenType.KW_IF, TokenType.KW_ELIF):
+            self.error("Expected 'if'")
+            return None
+        node.add_child(self._parse_condition())
+        self.expect(TokenType.OP_COLON, "Expected ':' after if condition")
+
+        body = ASTNode(ASTType.BLOCK, line=tok.line, column=tok.column)
+        self.parse_indented_block(body)
+        node.add_child(body)
+
+        if self.current().type == TokenType.KW_ELIF:
+            node.add_child(self.parse_if())
+        elif self.current().type == TokenType.KW_ELSE:
+            self.advance()
+            self.expect(TokenType.OP_COLON, "Expected ':' after else")
+            else_node = ASTNode(ASTType.BLOCK, line=self.current().line, column=self.current().column)
+            self.parse_indented_block(else_node)
+            node.add_child(else_node)
+        return node
+
+    def parse_while(self) -> Optional[ASTNode]:
+        tok = self.current()
+        node = ASTNode(ASTType.WHILE_STMT, line=tok.line, column=tok.column)
+        if not self.expect(TokenType.KW_WHILE, "Expected 'while'"):
+            return None
+        node.add_child(self._parse_condition())
+        self.expect(TokenType.OP_COLON, "Expected ':' after while condition")
+        body = ASTNode(ASTType.BLOCK, line=tok.line, column=tok.column)
+        self.parse_indented_block(body)
+        node.add_child(body)
+        return node
+
+    def parse_for(self) -> Optional[ASTNode]:
+        tok = self.current()
+        node = ASTNode(ASTType.FOR_STMT, line=tok.line, column=tok.column)
+        node.unroll_factor = self.current_unroll_factor
+        node.simd_level = self.current_simd_level
+        if not self.expect(TokenType.KW_FOR, "Expected 'for'"):
+            return None
+
+        if self.current().type == TokenType.OP_LPAREN:
+            node.value = "cstyle"
+            self.advance()
+            if self.current().type == TokenType.KW_LET:
+                node.add_child(self.parse_let(consume_semicolon=False))
+            elif self.current().type != TokenType.OP_SEMICOLON:
+                node.add_child(self._parse_assignment_expr())
+            else:
+                node.add_child(None)
+            self.expect(TokenType.OP_SEMICOLON, "Expected ';' in for header")
+            node.add_child(self.parse_expression())
+            self.expect(TokenType.OP_SEMICOLON, "Expected ';' in for header")
+            if self.current().type != TokenType.OP_RPAREN:
+                node.add_child(self._parse_assignment_expr())
+            else:
+                node.add_child(None)
+            self.expect(TokenType.OP_RPAREN, "Expected ')'")
+            self.expect(TokenType.OP_COLON, "Expected ':' after for header")
+            body = ASTNode(ASTType.BLOCK, line=tok.line, column=tok.column)
+            self.parse_indented_block(body)
+            node.add_child(body)
+            return node
+
+        if self.current().type == TokenType.TOK_IDENTIFIER and self.peek().type == TokenType.KW_IN:
+            var_tok = self.current()
+            self.advance()
+            self.advance()
+            var_node = ASTNode(ASTType.VARIABLE, var_tok.value, var_tok.line, var_tok.column)
+            node.add_child(var_node)
+
+            start = self.parse_expression()
+            if self.current().type == TokenType.KW_RANGE:
+                self.advance()
+                node.value = "range"
+                end = self.parse_expression()
+                step = None
+                if self.current().type == TokenType.KW_STEP:
+                    self.advance()
+                    step = self.parse_expression()
+                node.add_child(start)
+                node.add_child(end)
+                node.add_child(step if step else ASTNode(ASTType.LITERAL, "1", tok.line, tok.column))
+            else:
+                node.value = "each"
+                node.add_child(start)
+            self.expect(TokenType.OP_COLON, "Expected ':' after for header")
+            body = ASTNode(ASTType.BLOCK, line=tok.line, column=tok.column)
+            self.parse_indented_block(body)
+            node.add_child(body)
+            return node
+
+        self.error("Expected 'in' or '(' in for statement")
+        self.skip_to_line_end()
+        return None
+
+    def _parse_assignment_expr(self) -> Optional[ASTNode]:
+        """An expression, or an assignment such as `j = j + 1` (used in for headers)."""
+        expr = self.parse_expression()
+        assign_ops = {
+            TokenType.OP_ASSIGN: "=",
+            TokenType.OP_PLUS_ASSIGN: "+=",
+            TokenType.OP_MINUS_ASSIGN: "-=",
+            TokenType.OP_MULTIPLY_ASSIGN: "*=",
+            TokenType.OP_DIVIDE_ASSIGN: "/=",
+        }
+        if self.current().type in assign_ops:
+            op_tok = self.current()
+            self.advance()
+            node = ASTNode(ASTType.ASSIGN, assign_ops[op_tok.type], op_tok.line, op_tok.column)
+            node.add_child(expr)
+            node.add_child(self.parse_expression())
+            node.meta['is_declaration'] = False
+            return node
+        return expr
+
     def parse_switch(self) -> Optional[ASTNode]:
-        node = ASTNode(ASTType.SWITCH_STMT, line=self.current().line, column=self.current().column)
-        
+        tok = self.current()
+        node = ASTNode(ASTType.SWITCH_STMT, line=tok.line, column=tok.column)
         if not self.expect(TokenType.KW_SWITCH, "Expected 'switch'"):
             return None
-            
-        if not self.expect(TokenType.OP_LPAREN, "Expected '('"):
-            return None
-        node.add_child(self.parse_expression())
-        if not self.expect(TokenType.OP_RPAREN, "Expected ')'"):
-            return None
-            
-        if not self.expect(TokenType.OP_COLON, "Expected ':'"):
-            return None
-            
+        node.add_child(self._parse_condition())
+        self.expect(TokenType.OP_COLON, "Expected ':' after switch value")
         self.parse_indented_block(node)
         return node
-        
+
+    def parse_case(self) -> Optional[ASTNode]:
+        tok = self.current()
+        kind = "default" if tok.type == TokenType.KW_DEFAULT else "case"
+        node = ASTNode(ASTType.CASE_STMT, kind, tok.line, tok.column)
+        self.advance()
+
+        if kind == "case":
+            if self.current().type == TokenType.KW_WHEN:
+                self.advance()
+                node.value = "when"
+                node.add_child(self._parse_condition())
+            else:
+                node.add_child(self.parse_expression())
+        self.expect(TokenType.OP_COLON, "Expected ':' after case")
+
+        body = ASTNode(ASTType.BLOCK, line=tok.line, column=tok.column)
+        if self.current().type in (TokenType.NEWLINE, TokenType.INDENT):
+            self.parse_indented_block(body)
+        else:
+            self.parse_inline_block(body)
+        node.add_child(body)
+        return node
+
+    def parse_return(self) -> Optional[ASTNode]:
+        tok = self.current()
+        node = ASTNode(ASTType.RETURN_STMT, line=tok.line, column=tok.column)
+        if not self.expect(TokenType.KW_RETURN, "Expected 'return'"):
+            return None
+        if self.current().type not in (TokenType.OP_SEMICOLON, TokenType.NEWLINE,
+                                       TokenType.DEDENT, TokenType.TOK_EOF):
+            node.add_child(self.parse_expression())
+        self.match(TokenType.OP_SEMICOLON)
+        return node
+
+    def parse_with(self) -> Optional[ASTNode]:
+        tok = self.current()
+        node = ASTNode(ASTType.WITH_STMT, line=tok.line, column=tok.column)
+        if not self.expect(TokenType.KW_WITH, "Expected 'with'"):
+            return None
+        node.add_child(self.parse_expression())
+        self.expect(TokenType.OP_COLON, "Expected ':' after with expression")
+        self.parse_indented_block(node)
+        return node
+
+    def parse_block(self) -> Optional[ASTNode]:
+        tok = self.current()
+        node = ASTNode(ASTType.BLOCK, line=tok.line, column=tok.column)
+        if not self.expect(TokenType.OP_LBRACE, "Expected '{'"):
+            return None
+        self.symbols.enter_scope()
+        while self.current().type not in (TokenType.OP_RBRACE, TokenType.TOK_EOF):
+            before = self.pos
+            stmt = self.parse_statement()
+            if stmt:
+                node.add_child(stmt)
+            if self.pos == before:
+                self.advance()
+        self.expect(TokenType.OP_RBRACE, "Expected '}'")
+        self.symbols.exit_scope()
+        return node
+
+    def parse_asm_statement(self) -> Optional[ASTNode]:
+        tok = self.current()
+        node = ASTNode(ASTType.ASM_STMT, line=tok.line, column=tok.column)
+        if not self.expect(TokenType.KW_ASM, "Expected 'asm'"):
+            return None
+        if not self.expect(TokenType.OP_LPAREN, "Expected '(' after 'asm'"):
+            return None
+        if self.current().type != TokenType.TOK_STRING:
+            self.error("Expected assembly instruction string")
+            return None
+        node.value = self.current().value
+        self.advance()
+        self.expect(TokenType.OP_RPAREN, "Expected ')' after assembly string")
+        self.match(TokenType.OP_SEMICOLON)
+        return node
+
+    def parse_block_array(self) -> Optional[ASTNode]:
+        tok = self.current()
+        node = ASTNode(ASTType.BLOCK_ARRAY_TYPE, line=tok.line, column=tok.column)
+        self.advance()
+        if self.match(TokenType.OP_LPAREN):
+            if self.at_generic_open():
+                self.advance()
+                node.block_array_type = self.parse_type()
+                self.expect_generic_close("Expected '>'")
+            if self.match(TokenType.OP_COMMA):
+                if self.current().type == TokenType.TOK_NUMBER:
+                    try:
+                        node.block_size = int(self.current().value, 0)
+                    except ValueError:
+                        node.block_size = 256
+                    self.advance()
+            self.expect(TokenType.OP_RPAREN, "Expected ')'")
+        if self.match(TokenType.OP_ASSIGN):
+            node.add_child(self.parse_expression())
+        self.match(TokenType.OP_SEMICOLON)
+        return node
+
+    # -- pragmas ------------------------------------------------------------
+    def parse_pragma_optimize(self) -> ASTNode:
+        tok = self.current()
+        self.advance()
+        node = ASTNode(ASTType.PRAGMA, tok.value, tok.line, tok.column)
+        node.meta['pragma'] = 'optimize'
+        if tok.value == 'O0':
+            self.current_opt_level = OptimizationLevel.O0
+        elif tok.value == 'O1':
+            self.current_opt_level = OptimizationLevel.O1
+        elif tok.value == 'O3':
+            self.current_opt_level = OptimizationLevel.O3
+        else:
+            self.current_opt_level = OptimizationLevel.O2
+        return node
+
+    def parse_pragma_simd(self) -> ASTNode:
+        tok = self.current()
+        self.advance()
+        node = ASTNode(ASTType.PRAGMA, tok.value, tok.line, tok.column)
+        node.meta['pragma'] = 'simd'
+        if tok.value == 'SSE':
+            self.current_simd_level = SIMDLevel.SSE
+        elif tok.value == 'AVX':
+            self.current_simd_level = SIMDLevel.AVX
+        elif tok.value == 'AVX512':
+            self.current_simd_level = SIMDLevel.AVX512
+        return node
+
+    def parse_pragma_unroll(self) -> ASTNode:
+        tok = self.current()
+        self.advance()
+        node = ASTNode(ASTType.PRAGMA, tok.value, tok.line, tok.column)
+        node.meta['pragma'] = 'unroll'
+        try:
+            self.current_unroll_factor = int(tok.value)
+        except (TypeError, ValueError):
+            self.current_unroll_factor = 0
+        return node
+
+    def parse_import(self) -> Optional[ASTNode]:
+        tok = self.current()
+        self.advance()
+        node = ASTNode(ASTType.IMPORT_STMT, line=tok.line, column=tok.column)
+        if self.current().type == TokenType.TOK_STRING:
+            node.import_path = self.current().value
+            self.advance()
+        if self.current().type == TokenType.TOK_IDENTIFIER:
+            node.value = self.current().value
+            self.advance()
+        self.match(TokenType.OP_SEMICOLON)
+        return node
+
+    def parse_export(self) -> Optional[ASTNode]:
+        tok = self.current()
+        self.advance()
+        node = ASTNode(ASTType.EXPORT_STMT, line=tok.line, column=tok.column)
+        if self.current().type == TokenType.TOK_IDENTIFIER:
+            node.export_name = self.current().value
+            node.value = self.current().value
+            self.advance()
+            self.symbols.exported_symbols.add(node.export_name)
+        self.match(TokenType.OP_SEMICOLON)
+        return node
+
+    def parse_module(self) -> Optional[ASTNode]:
+        tok = self.current()
+        self.advance()
+        node = ASTNode(ASTType.MODULE, line=tok.line, column=tok.column)
+        if self.current().type == TokenType.TOK_IDENTIFIER:
+            node.value = self.current().value
+            self.advance()
+        self.expect(TokenType.OP_COLON, "Expected ':' after module name")
+        self.parse_indented_block(node)
+        return node
+
     def parse_data_section(self) -> Optional[ASTNode]:
-        node = ASTNode(ASTType.DATA_SECTION, line=self.current().line, column=self.current().column)
-        
+        tok = self.current()
+        node = ASTNode(ASTType.DATA_SECTION, line=tok.line, column=tok.column)
         if not self.expect(TokenType.KW_DATA_SECTION, "Expected 'data_section'"):
             return None
-            
         if self.current().type == TokenType.KW_FROM:
             self.advance()
             if self.current().type == TokenType.TOK_STRING:
                 node.external_file = self.current().value
                 self.advance()
-                
         if self.current().type == TokenType.TOK_IDENTIFIER:
             node.value = self.current().value
             self.advance()
-            
         if self.match(TokenType.KW_COLUMNAR):
             node.data_format = "columnar"
         elif self.match(TokenType.KW_INDENTED):
             node.data_format = "indented"
-        elif self.current().type == TokenType.TOK_IDENTIFIER:
-            node.data_format = self.current().value
-            self.advance()
-            
-        if not self.expect(TokenType.OP_COLON, "Expected ':'"):
-            return None
-            
+        self.expect(TokenType.OP_COLON, "Expected ':' after data_section")
         self.parse_indented_block(node)
         return node
-        
+
+    # -- expressions --------------------------------------------------------
     def get_precedence(self, tok_type: TokenType) -> int:
         prec_map = {
-            TokenType.OP_ASSIGN: 1,
-            TokenType.OP_PLUS_ASSIGN: 1, TokenType.OP_MINUS_ASSIGN: 1,
-            TokenType.OP_MULTIPLY_ASSIGN: 1, TokenType.OP_DIVIDE_ASSIGN: 1,
-            TokenType.OP_CONVERT: 2,
-            TokenType.OP_AND: 3, TokenType.OP_OR: 3,
-            TokenType.OP_EQ: 4, TokenType.OP_NE: 4,
-            TokenType.OP_LT: 5, TokenType.OP_LE: 5, TokenType.OP_GT: 5, TokenType.OP_GE: 5,
-            TokenType.OP_BIT_AND: 6, TokenType.OP_BIT_XOR: 7, TokenType.OP_BIT_OR: 8,
-            TokenType.OP_PLUS: 9, TokenType.OP_MINUS: 9,
-            TokenType.OP_MULTIPLY: 10, TokenType.OP_DIVIDE: 10, TokenType.OP_MOD: 10,
-            TokenType.OP_SHL: 11, TokenType.OP_SHR: 11,
+            TokenType.OP_CONVERT: 12,
+            TokenType.OP_COLON: 12,
+            TokenType.OP_OR: 3,
+            TokenType.OP_AND: 4,
+            TokenType.OP_EQ: 5, TokenType.OP_NE: 5,
+            TokenType.OP_LT: 6, TokenType.OP_LE: 6, TokenType.OP_GT: 6, TokenType.OP_GE: 6,
+            TokenType.OP_BIT_OR: 7, TokenType.OP_BIT_XOR: 8, TokenType.OP_BIT_AND: 9,
+            TokenType.OP_SHL: 10, TokenType.OP_SHR: 10,
+            TokenType.OP_PLUS: 11, TokenType.OP_MINUS: 11,
+            TokenType.OP_MULTIPLY: 13, TokenType.OP_DIVIDE: 13, TokenType.OP_MOD: 13,
+            TokenType.OP_POW: 14,
         }
         return prec_map.get(tok_type, 0)
-        
+
     def parse_expression(self) -> Optional[ASTNode]:
         return self.parse_binary_op(0)
-        
+
     def parse_binary_op(self, min_precedence: int) -> Optional[ASTNode]:
-        left = self.parse_primary()
+        left = self.parse_unary()
         if not left:
             return None
-            
+
         while True:
             tok = self.current()
             precedence = self.get_precedence(tok.type)
             if precedence == 0 or precedence < min_precedence:
                 break
+
+            # ':' is a conversion only when a type name follows it; otherwise it
+            # opens a block (if/while/for/switch/case) and belongs to the caller
+            if tok.type == TokenType.OP_COLON:
+                nxt = self.peek()
+                if nxt.type in TYPE_START_TOKENS or nxt.value in PRIMITIVE_TYPES \
+                        or nxt.value in ('ptr', 'ptr_mut', 'mmio_ptr', 'array', 'Option',
+                                         'BlockArray', 'block_array'):
+                    self.advance()
+                    left = self.parse_type_conversion(left)
+                    continue
+                break
+
             self.advance()
-            
             if tok.type == TokenType.OP_CONVERT:
                 left = self.parse_type_conversion(left)
-            else:
-                right = self.parse_binary_op(precedence + 1)
-                if not right:
-                    return None
-                binary = ASTNode(ASTType.BINARY_OP, tok.value, tok.line, tok.column)
-                binary.add_child(left)
-                binary.add_child(right)
-                left = binary
-            
+                continue
+
+            next_min = precedence if tok.type == TokenType.OP_POW else precedence + 1
+            right = self.parse_binary_op(next_min)
+            if not right:
+                return left
+            binary = ASTNode(ASTType.BINARY_OP, tok.value, tok.line, tok.column)
+            binary.add_child(left)
+            binary.add_child(right)
+            binary.data_type = self._binary_result_type(binary)
+            left = binary
         return left
-        
+
+    def _binary_result_type(self, node: ASTNode) -> DataType:
+        left = node.children[0] if node.children else None
+        right = node.children[1] if len(node.children) > 1 else None
+        for side in (left, right):
+            if side is None:
+                continue
+            if side.data_type in FLOAT_TYPES:
+                return side.data_type
+            side_ref = side.meta.get('type_ref')
+            if isinstance(side_ref, TypeRef) and side_ref.base in FLOAT_TYPES:
+                return side_ref.base
+        if node.value in ('==', '!=', '<', '<=', '>', '>=', 'and', 'or'):
+            return DataType.BOOL
+        if left is not None:
+            left_ref = left.meta.get('type_ref')
+            if isinstance(left_ref, TypeRef):
+                return left_ref.base
+            return left.data_type
+        return DataType.U64
+
+    def parse_unary(self) -> Optional[ASTNode]:
+        tok = self.current()
+        if tok.type in (TokenType.OP_MINUS, TokenType.OP_NOT, TokenType.OP_BIT_NOT,
+                        TokenType.OP_BIT_AND, TokenType.OP_MULTIPLY):
+            self.advance()
+            is_mut_ref = self.match(TokenType.KW_MUT)
+            operand = self.parse_unary()
+            if operand is None:
+                return None
+            node = ASTNode(ASTType.UNARY_OP, tok.value, tok.line, tok.column)
+            node.add_child(operand)
+            if tok.value == '&':
+                node.meta['type_ref'] = TypeRef(base=DataType.PTR_MUT if is_mut_ref else DataType.PTR,
+                                                elem=operand.meta.get('type_ref'))
+            elif tok.value == '*':
+                inner = operand.meta.get('type_ref')
+                if isinstance(inner, TypeRef) and inner.elem is not None:
+                    node.meta['type_ref'] = inner.elem
+            return node
+        if tok.type in (TokenType.OP_INC, TokenType.OP_DEC):
+            self.advance()
+            operand = self.parse_unary()
+            node = ASTNode(ASTType.UNARY_OP, tok.value, tok.line, tok.column)
+            node.meta['prefix'] = True
+            node.add_child(operand)
+            return node
+        if tok.type == TokenType.OP_LPAREN:
+            self.advance()
+            first = self.parse_expression()
+            if self.current().type == TokenType.OP_COMMA:
+                node = ASTNode(ASTType.TUPLE, "()", tok.line, tok.column)
+                if first:
+                    node.add_child(first)
+                while self.match(TokenType.OP_COMMA):
+                    if self.current().type == TokenType.OP_RPAREN:
+                        break
+                    node.add_child(self.parse_expression())
+                self.expect(TokenType.OP_RPAREN, "Expected ')'")
+                node.meta['type_ref'] = TypeRef(base=DataType.TUPLE)
+                return node
+            self.expect(TokenType.OP_RPAREN, "Expected ')'")
+            if first is not None:
+                first.meta['parenthesised'] = True
+            return first
+        return self.parse_postfix()
+
+    def parse_postfix(self) -> Optional[ASTNode]:
+        node = self.parse_primary()
+        if node is None:
+            return None
+        return self.parse_postfix_ops(node)
+
+    def parse_postfix_ops(self, node: ASTNode) -> ASTNode:
+        while True:
+            tok = self.current()
+            if tok.type == TokenType.OP_LBRACKET:
+                self.advance()
+                index = self.parse_expression()
+                self.expect(TokenType.OP_RBRACKET, "Expected ']'")
+                index_node = ASTNode(ASTType.INDEX, "[]", tok.line, tok.column)
+                index_node.add_child(node)
+                index_node.add_child(index)
+                elem = None
+                base_ref = node.meta.get('type_ref')
+                if isinstance(base_ref, TypeRef) and base_ref.elem is not None:
+                    elem = base_ref.elem
+                index_node.meta['type_ref'] = elem or TypeRef(base=DataType.U64)
+                node = index_node
+                continue
+            if tok.type == TokenType.OP_DOT:
+                self.advance()
+                name_tok = self.current()
+                if not name_tok.value or not str(name_tok.value).replace('_', 'a').isalnum():
+                    self.error("Expected member name after '.'")
+                    return node
+                self.advance()
+                if self.current().type == TokenType.OP_LPAREN:
+                    call = ASTNode(ASTType.METHOD_CALL, name_tok.value, tok.line, tok.column)
+                    call.add_child(node)
+                    self.advance()
+                    self._parse_arguments(call)
+                    node = call
+                else:
+                    member = ASTNode(ASTType.MEMBER_ACCESS, name_tok.value, tok.line, tok.column)
+                    member.add_child(node)
+                    node = member
+                continue
+            if tok.type == TokenType.OP_LPAREN:
+                call = ASTNode(ASTType.CALL, node.value, tok.line, tok.column)
+                call.add_child(node)
+                self.advance()
+                self._parse_arguments(call)
+                node = call
+                continue
+            break
+        return node
+
+    def _parse_arguments(self, call: ASTNode) -> None:
+        self.skip_soft_newlines()
+        while self.current().type not in (TokenType.OP_RPAREN, TokenType.TOK_EOF):
+            before = self.pos
+            arg = self.parse_expression()
+            if arg:
+                call.add_child(arg)
+            self.skip_soft_newlines()
+            if not self.match(TokenType.OP_COMMA):
+                break
+            self.skip_soft_newlines()
+            if self.pos == before:
+                break
+        self.expect(TokenType.OP_RPAREN, "Expected ')'")
+
     def parse_primary(self) -> Optional[ASTNode]:
         tok = self.current()
-        
-        if tok.type == TokenType.TOK_NUMBER or tok.type == TokenType.TOK_HEX or tok.type == TokenType.TOK_BINARY:
+
+        if tok.type in (TokenType.TOK_NUMBER, TokenType.TOK_HEX, TokenType.TOK_BINARY):
             self.advance()
             node = ASTNode(ASTType.LITERAL, tok.value, tok.line, tok.column)
-            node.data_type = DataType.U64
+            if '.' in tok.value or 'e' in tok.value.lower():
+                node.data_type = DataType.F64
+            else:
+                node.data_type = DataType.U64
             return node
-            
+
+        if tok.type == TokenType.TOK_CHAR:
+            self.advance()
+            node = ASTNode(ASTType.LITERAL, tok.value, tok.line, tok.column)
+            node.data_type = DataType.CHAR
+            node.meta['char_value'] = ord(tok.value[0]) if tok.value else 0
+            return node
+
         if tok.type == TokenType.TOK_STRING:
             self.advance()
             node = ASTNode(ASTType.LITERAL, tok.value, tok.line, tok.column)
             node.data_type = DataType.CHAR
+            node.meta['is_string'] = True
             return node
-            
-        if tok.type == TokenType.TOK_IDENTIFIER:
+
+        if tok.type in (TokenType.KW_TRUE, TokenType.KW_FALSE):
             self.advance()
-            if tok.value in BUILTIN_FUNCTIONS:
-                node = ASTNode(ASTType.BUILTIN_CALL, tok.value, tok.line, tok.column)
-                if self.current().type == TokenType.OP_LPAREN:
-                    self.advance()
-                    while self.current().type != TokenType.OP_RPAREN and self.current().type != TokenType.TOK_EOF:
-                        node.add_child(self.parse_expression())
-                        if self.current().type == TokenType.OP_COMMA:
-                            self.advance()
-                    self.expect(TokenType.OP_RPAREN, "Expected ')'")
-                return node
-                
-            var_node = ASTNode(ASTType.VARIABLE, tok.value, tok.line, tok.column)
-            return self.parse_postfix(var_node)
-            
-        if tok.type == TokenType.KW_VEC4_F32:
+            node = ASTNode(ASTType.LITERAL, "1" if tok.type == TokenType.KW_TRUE else "0",
+                           tok.line, tok.column)
+            node.data_type = DataType.BOOL
+            return node
+
+        if tok.type in (TokenType.KW_NULL, TokenType.KW_NONE):
             self.advance()
-            node = ASTNode(ASTType.SIMD_OPERATION, "vec4_f32", tok.line, tok.column)
-            node.simd_level = SIMDLevel.SSE
+            node = ASTNode(ASTType.LITERAL, "0", tok.line, tok.column)
+            node.data_type = DataType.U64
+            return node
+
+        if tok.type in (TokenType.KW_VEC4_F32, TokenType.KW_VEC8_F32, TokenType.KW_VEC16_F32):
+            self.advance()
+            node = ASTNode(ASTType.SIMD_OPERATION, tok.value, tok.line, tok.column)
+            node.simd_level = {TokenType.KW_VEC4_F32: SIMDLevel.SSE,
+                               TokenType.KW_VEC8_F32: SIMDLevel.AVX,
+                               TokenType.KW_VEC16_F32: SIMDLevel.AVX512}[tok.type]
             return self.parse_simd_constructor(node)
-            
-        if tok.type == TokenType.KW_VEC8_F32:
-            self.advance()
-            node = ASTNode(ASTType.SIMD_OPERATION, "vec8_f32", tok.line, tok.column)
-            node.simd_level = SIMDLevel.AVX
-            return self.parse_simd_constructor(node)
-            
-        if tok.type == TokenType.KW_VEC16_F32:
-            self.advance()
-            node = ASTNode(ASTType.SIMD_OPERATION, "vec16_f32", tok.line, tok.column)
-            node.simd_level = SIMDLevel.AVX512
-            return self.parse_simd_constructor(node)
-            
-        if tok.type == TokenType.KW_TRUE:
-            self.advance()
-            return ASTNode(ASTType.LITERAL, "1", tok.line, tok.column)
-            
-        if tok.type == TokenType.KW_FALSE:
-            self.advance()
-            return ASTNode(ASTType.LITERAL, "0", tok.line, tok.column)
-            
-        if tok.type == TokenType.KW_NULL:
-            self.advance()
-            return ASTNode(ASTType.LITERAL, "0", tok.line, tok.column)
-            
+
         if tok.type == TokenType.KW_NEW:
             self.advance()
             return self.parse_constructor()
-            
+
+        if tok.type == TokenType.KW_SUPER:
+            self.advance()
+            node = ASTNode(ASTType.VARIABLE, "super", tok.line, tok.column)
+            return self.parse_postfix_ops(node)
+
+        if tok.type in (TokenType.KW_SELF, TokenType.KW_THIS):
+            self.advance()
+            node = ASTNode(ASTType.VARIABLE, "self", tok.line, tok.column)
+            sym = self.symbols.lookup("self")
+            if sym is not None and sym.type_ref is not None:
+                node.meta['type_ref'] = sym.type_ref
+            self._stamp_var(node, "self")
+            return self.parse_postfix_ops(node)
+
+        if tok.type in (TokenType.KW_FN, TokenType.KW_DEF):
+            return self.parse_lambda()
+
         if tok.type == TokenType.KW_BLOCK_ARRAY:
             self.advance()
             node = ASTNode(ASTType.BLOCK_ARRAY_TYPE, line=tok.line, column=tok.column)
-            if self.match(TokenType.OP_LPAREN):
+            if self.at_generic_open():
+                self.advance()
                 node.block_array_type = self.parse_type()
-                self.expect(TokenType.OP_RPAREN, "Expected ')'")
+                self.expect_generic_close("Expected '>'")
             return node
-            
-        if tok.type == TokenType.OP_LPAREN:
+
+        if tok.type == TokenType.OP_LBRACKET:
+            return self.parse_array_literal()
+
+        if tok.type in (TokenType.TOK_IDENTIFIER, TokenType.KW_OPTION):
             self.advance()
-            expr = self.parse_expression()
-            self.expect(TokenType.OP_RPAREN, "Expected ')'")
-            return expr
-            
-        self.errors.add_error(f"Unexpected token: {tok.value}", tok.line, tok.column)
-        return None
-        
-    def parse_simd_constructor(self, node: ASTNode) -> ASTNode:
-        if self.match(TokenType.OP_LPAREN):
-            while self.current().type != TokenType.OP_RPAREN and self.current().type != TokenType.TOK_EOF:
-                node.add_child(self.parse_expression())
-                if self.current().type == TokenType.OP_COMMA:
+            if tok.value in BUILTIN_FUNCTIONS:
+                node = ASTNode(ASTType.BUILTIN_CALL, tok.value, tok.line, tok.column)
+                node.meta['return_ref'] = TypeRef(base=BUILTIN_FUNCTIONS[tok.value][1])
+                if self.current().type == TokenType.OP_LPAREN:
                     self.advance()
-            self.expect(TokenType.OP_RPAREN, "Expected ')'")
-        return node
-        
-    def parse_constructor(self) -> Optional[ASTNode]:
-        class_name = self.current().value
-        self.advance()
-        
-        node = ASTNode(ASTType.METHOD_CALL, "new", self.current().line, self.current().column)
-        node.value = class_name
-        
-        if self.expect(TokenType.OP_LPAREN, "Expected '('"):
-            while self.current().type != TokenType.OP_RPAREN and self.current().type != TokenType.TOK_EOF:
-                node.add_child(self.parse_expression())
-                if self.current().type == TokenType.OP_COMMA:
-                    self.advance()
-            self.expect(TokenType.OP_RPAREN, "Expected ')'")
-        return node
-        
-    def parse_postfix(self, node: ASTNode) -> ASTNode:
-        while True:
-            if self.current().type == TokenType.OP_LBRACKET:
-                self.advance()
-                index = self.parse_expression()
-                self.expect(TokenType.OP_RBRACKET, "Expected ']'")
-                if self.current().type == TokenType.OP_ASSIGN:
-                    op = self.current()
-                    self.advance()
-                    assign = ASTNode(ASTType.ASSIGN, op.value, op.line, op.column)
-                    assign.add_child(node)
-                    assign.add_child(self.parse_expression())
-                    return assign
-                node.children.append(index if index else ASTNode(ASTType.LITERAL, "0", node.line, node.column))
+                    self._parse_arguments(node)
                 return node
-            elif self.current().type == TokenType.OP_DOT:
+
+            if self.current().type == TokenType.OP_LBRACE and tok.value in self.known_types:
+                return self.parse_struct_literal(tok)
+
+            # generic instantiation: Stack<u64>.new(), Pair<K, V>{...}
+            if self.at_generic_open() and tok.value in self.known_types:
                 self.advance()
-                method_name = self.current().value
-                self.advance()
-                
-                # Check for SIMD methods
-                simd_methods = ['add', 'sub', 'mul', 'div', 'hadd', 'hmax', 'hmin', 'dot', 'sqrt', 'rcp', 'rsqrt']
-                method_lower = method_name.lower()
-                is_simd = method_name.startswith('vec') or any(m in method_lower for m in ['vec', 'simd', 'load', 'store', 'permute', 'shuffle'])
-                
-                if is_simd or method_lower in simd_methods:
-                    simd_node = ASTNode(ASTType.SIMD_OPERATION, method_name, node.line, node.column)
-                    simd_node.add_child(node)
-                    if self.current().type == TokenType.OP_LPAREN:
-                        self.advance()
-                        while self.current().type != TokenType.OP_RPAREN and self.current().type != TokenType.TOK_EOF:
-                            simd_node.add_child(self.parse_expression())
-                            if self.current().type == TokenType.OP_COMMA:
-                                self.advance()
-                        self.expect(TokenType.OP_RPAREN, "Expected ')'")
-                    return simd_node
-                elif self.current().type == TokenType.OP_LPAREN:
-                    block_array_method = ASTNode(ASTType.BLOCK_ARRAY_METHOD, method_name, node.line, node.column)
-                    block_array_method.add_child(node)
-                    block_array_method.simd_level = self.current_simd_level
-                    block_array_method.unroll_factor = self.current_unroll_factor
+                while not self.at_generic_close() and self.current().type != TokenType.TOK_EOF:
                     self.advance()
-                    while self.current().type != TokenType.OP_RPAREN and self.current().type != TokenType.TOK_EOF:
-                        block_array_method.add_child(self.parse_expression())
-                        if self.current().type == TokenType.OP_COMMA:
-                            self.advance()
-                    self.expect(TokenType.OP_RPAREN, "Expected ')'")
-                    return block_array_method
-                else:
-                    member = ASTNode(ASTType.MEMBER_ACCESS, method_name, node.line, node.column)
-                    member.add_child(node)
-                    return member
-            elif self.current().type == TokenType.OP_LPAREN:
-                call = ASTNode(ASTType.CALL, node.value, node.line, node.column)
-                call.add_child(node)
-                self.advance()
-                while self.current().type != TokenType.OP_RPAREN:
-                    call.add_child(self.parse_expression())
-                    if self.current().type == TokenType.OP_COMMA:
-                        self.advance()
-                self.expect(TokenType.OP_RPAREN, "Expected ')'")
-                node = call
-            else:
-                break
-        return node
-        
-    def parse_if(self) -> Optional[ASTNode]:
-        node = ASTNode(ASTType.IF_STMT, line=self.current().line, column=self.current().column)
-        if not self.expect(TokenType.KW_IF, "Expected 'if'"):
-            return None
-        if not self.expect(TokenType.OP_LPAREN, "Expected '('"):
-            return None
-        node.add_child(self.parse_expression())
-        if not self.expect(TokenType.OP_RPAREN, "Expected ')'"):
-            return None
-        self.parse_indented_block(node)
-        
-        if self.current().type == TokenType.KW_ELSE:
+                self.expect_generic_close("Expected '>'")
+
+            var_node = ASTNode(ASTType.VARIABLE, tok.value, tok.line, tok.column)
+            sym = self.symbols.lookup(tok.value)
+            if sym is not None and sym.type_ref is not None:
+                var_node.meta['type_ref'] = sym.type_ref
+            elif tok.value in self.known_types:
+                var_node.meta['type_ref'] = self.known_types[tok.value]
+                var_node.meta['is_type_name'] = True
+            if tok.value not in self.known_types:
+                self._stamp_var(var_node, tok.value)
+            return self.parse_postfix_ops(var_node)
+
+        if self.is_name_token(tok) and self.symbols.lookup(tok.value) is not None:
             self.advance()
-            else_node = ASTNode(ASTType.BLOCK, line=self.current().line, column=self.current().column)
-            self.parse_indented_block(else_node)
-            node.add_child(else_node)
+            var_node = ASTNode(ASTType.VARIABLE, tok.value, tok.line, tok.column)
+            sym = self.symbols.lookup(tok.value)
+            if sym is not None and sym.type_ref is not None:
+                var_node.meta['type_ref'] = sym.type_ref
+            self._stamp_var(var_node, tok.value)
+            return self.parse_postfix_ops(var_node)
+
+        self.error(f"Unexpected token: {tok.value}")
+        self.advance()
+        return None
+
+    def parse_struct_literal(self, tok: Token) -> ASTNode:
+        node = ASTNode(ASTType.STRUCT_LITERAL, tok.value, tok.line, tok.column)
+        self.expect(TokenType.OP_LBRACE, "Expected '{'")
+        self.skip_soft_newlines()
+        while self.current().type not in (TokenType.OP_RBRACE, TokenType.TOK_EOF):
+            if self.current().type == TokenType.TOK_IDENTIFIER and self.peek().type == TokenType.OP_COLON:
+                field_name = self.current().value
+                self.advance()
+                self.advance()
+                value = self.parse_expression()
+                if value is not None:
+                    value.meta['field_name'] = field_name
+                    node.add_child(value)
+            else:
+                node.add_child(self.parse_expression())
+            self.skip_soft_newlines()
+            if not self.match(TokenType.OP_COMMA):
+                break
+            self.skip_soft_newlines()
+        self.expect(TokenType.OP_RBRACE, "Expected '}'")
+        node.meta['type_ref'] = TypeRef(base=DataType.STRUCT, name=tok.value)
         return node
-        
-    def parse_while(self) -> Optional[ASTNode]:
-        node = ASTNode(ASTType.WHILE_STMT, line=self.current().line, column=self.current().column)
-        if not self.expect(TokenType.KW_WHILE, "Expected 'while'"):
-            return None
-        if not self.expect(TokenType.OP_LPAREN, "Expected '('"):
-            return None
-        node.add_child(self.parse_expression())
-        if not self.expect(TokenType.OP_RPAREN, "Expected ')'"):
-            return None
-        self.parse_indented_block(node)
+
+    def parse_array_literal(self) -> ASTNode:
+        tok = self.current()
+        node = ASTNode(ASTType.ARRAY_LITERAL, "[]", tok.line, tok.column)
+        self.expect(TokenType.OP_LBRACKET, "Expected '['")
+        self.skip_soft_newlines()
+        if self.current().type == TokenType.OP_RBRACKET:
+            self.advance()
+            node.meta['type_ref'] = TypeRef(base=DataType.ARRAY, elem=TypeRef(base=DataType.U64), length=0)
+            return node
+        first = self.parse_expression()
+        self.skip_soft_newlines()
+        if self.match(TokenType.OP_SEMICOLON):
+            count = self.parse_expression()
+            repeat = 0
+            if count is not None and count.value.isdigit():
+                repeat = int(count.value)
+            node.meta['repeat'] = repeat
+            if first:
+                node.add_child(first)
+            self.expect(TokenType.OP_RBRACKET, "Expected ']'")
+        else:
+            if first:
+                node.add_child(first)
+            while True:
+                self.skip_soft_newlines()
+                if not self.match(TokenType.OP_COMMA):
+                    break
+                self.skip_soft_newlines()
+                if self.current().type == TokenType.OP_RBRACKET:
+                    break
+                node.add_child(self.parse_expression())
+            self.skip_soft_newlines()
+            self.expect(TokenType.OP_RBRACKET, "Expected ']'")
+        elem = self._infer_ref(node.children[0]) if node.children else TypeRef(base=DataType.U64)
+        length = node.meta.get('repeat') or len(node.children)
+        node.meta['type_ref'] = TypeRef(base=DataType.ARRAY, elem=elem, length=length)
         return node
-        
-    def parse_for(self) -> Optional[ASTNode]:
-        node = ASTNode(ASTType.FOR_STMT, line=self.current().line, column=self.current().column)
-        node.unroll_factor = self.current_unroll_factor
-        node.simd_level = self.current_simd_level
-        
-        if not self.expect(TokenType.KW_FOR, "Expected 'for'"):
-            return None
-        if not self.expect(TokenType.OP_LPAREN, "Expected '('"):
-            return None
-            
-        if self.current().type == TokenType.KW_LET:
-            node.add_child(self.parse_let())
-        elif self.current().type != TokenType.OP_SEMICOLON:
-            node.add_child(self.parse_expression())
-        self.match(TokenType.OP_SEMICOLON)
-        
-        node.add_child(self.parse_expression())
-        self.match(TokenType.OP_SEMICOLON)
-        
-        if self.current().type != TokenType.OP_RPAREN:
-            node.add_child(self.parse_expression())
-            
-        if not self.expect(TokenType.OP_RPAREN, "Expected ')'"):
-            return None
-            
-        body = ASTNode(ASTType.BLOCK, line=self.current().line, column=self.current().column)
-        self.parse_indented_block(body)
+
+    def parse_lambda(self) -> ASTNode:
+        tok = self.current()
+        node = ASTNode(ASTType.LAMBDA, "lambda", tok.line, tok.column)
+        self.advance()
+        param_refs: List[TypeRef] = []
+        param_names: List[str] = []
+        if self.match(TokenType.OP_LPAREN):
+            while self.current().type not in (TokenType.OP_RPAREN, TokenType.TOK_EOF):
+                if self.current().type == TokenType.TOK_IDENTIFIER:
+                    param_names.append(self.current().value)
+                    self.advance()
+                    if self.match(TokenType.OP_COLON):
+                        param_refs.append(self.parse_type_ref())
+                    else:
+                        param_refs.append(TypeRef(base=DataType.U64))
+                if not self.match(TokenType.OP_COMMA):
+                    break
+            self.expect(TokenType.OP_RPAREN, "Expected ')'")
+        ret_ref = TypeRef(base=DataType.U64)
+        if self.match(TokenType.OP_ARROW):
+            ret_ref = self.parse_type_ref()
+        node.meta['param_refs'] = param_refs
+        node.meta['param_names'] = param_names
+        node.meta['return_ref'] = ret_ref
+        node.meta['type_ref'] = TypeRef(base=DataType.FN)
+        self.expect(TokenType.OP_COLON, "Expected ':' before lambda body")
+        body = ASTNode(ASTType.BLOCK, line=tok.line, column=tok.column)
+        if self.current().type in (TokenType.NEWLINE, TokenType.INDENT):
+            self.parse_indented_block(body)
+        else:
+            self.parse_inline_block(body)
         node.add_child(body)
         return node
-        
-    def parse_return(self) -> Optional[ASTNode]:
-        node = ASTNode(ASTType.RETURN_STMT, line=self.current().line, column=self.current().column)
-        if not self.expect(TokenType.KW_RETURN, "Expected 'return'"):
-            return None
-        if self.current().type not in (TokenType.OP_SEMICOLON, TokenType.NEWLINE, TokenType.DEDENT):
-            node.add_child(self.parse_expression())
-        self.match(TokenType.OP_SEMICOLON)
+
+    def parse_simd_constructor(self, node: ASTNode) -> ASTNode:
+        if self.match(TokenType.OP_LPAREN):
+            self._parse_arguments(node)
         return node
-        
-    def parse_with(self) -> Optional[ASTNode]:
-        node = ASTNode(ASTType.WITH_STMT, line=self.current().line, column=self.current().column)
-        if not self.expect(TokenType.KW_WITH, "Expected 'with'"):
-            return None
-        node.add_child(self.parse_expression())
-        self.parse_indented_block(node)
+
+    def parse_constructor(self) -> Optional[ASTNode]:
+        name_tok = self.current()
+        self.advance()
+        node = ASTNode(ASTType.METHOD_CALL, "new", name_tok.line, name_tok.column)
+        node.meta['constructed_type'] = name_tok.value
+        callee = ASTNode(ASTType.VARIABLE, name_tok.value, name_tok.line, name_tok.column)
+        callee.meta['type_ref'] = TypeRef(base=DataType.STRUCT, name=name_tok.value)
+        node.add_child(callee)
+        if self.match(TokenType.OP_LPAREN):
+            self._parse_arguments(node)
         return node
-        
-    def parse_block(self) -> Optional[ASTNode]:
-        node = ASTNode(ASTType.BLOCK, line=self.current().line, column=self.current().column)
-        if not self.expect(TokenType.OP_LBRACE, "Expected '{'"):
-            return None
-            
-        self.symbols.enter_scope()
-        while self.current().type != TokenType.OP_RBRACE and self.current().type != TokenType.TOK_EOF:
-            stmt = self.parse_statement()
-            if stmt:
-                node.add_child(stmt)
-            else:
-                break
-        self.expect(TokenType.OP_RBRACE, "Expected '}'")
-        self.symbols.exit_scope()
-        return node
+
 
 # ============================================================================
 # Builtin Functions
@@ -1946,7 +3029,10 @@ class CodeGenerator:
         self.module_exports: Dict[str, int] = {}
         self.current_function_is_interrupt = False
         self.current_function_is_kernel = False
-        
+        self.break_labels: List[str] = []
+        self.continue_labels: List[str] = []
+        self.pending_lambdas: List[ASTNode] = []
+
     def new_label(self) -> str:
         self.label_counter += 1
         return f".L{self.label_counter - 1}"
@@ -2037,9 +3123,6 @@ class CodeGenerator:
             else:
                 self.emit_raw("global main", "text")
             self.emit_raw("", "text")
-            self.emit_raw("section .data", "data")
-            self.emit_raw("section .bss", "bss")
-            self.emit_raw("section .rodata", "rodata")
         else:
             self.emit_raw(".text", "text")
             self.emit_raw(".global main", "text")
@@ -2077,7 +3160,12 @@ class CodeGenerator:
         
         for child in node.children:
             self.gen_statement(child)
-            
+
+        # lambdas discovered while generating expressions become real functions
+        while self.pending_lambdas:
+            lam = self.pending_lambdas.pop(0)
+            self.gen_lambda(lam)
+
         if len(self.text) < 10 and self.output_format != OutputFormat.BOOT_IMAGE:
             if self.output_format == OutputFormat.KERNEL_MODULE:
                 self.emit_raw("module_init:", "text")
@@ -2092,11 +3180,11 @@ class CodeGenerator:
             
         result = "\n".join(self.text) + "\n\n"
         if self.rodata:
-            result += "\n".join(self.rodata) + "\n\n"
+            result += "section .rodata\n" + "\n".join(self.rodata) + "\n\n"
         if self.data:
-            result += "\n".join(self.data) + "\n\n"
+            result += "section .data\n" + "\n".join(self.data) + "\n\n"
         if self.bss:
-            result += "\n".join(self.bss) + "\n"
+            result += "section .bss\n" + "\n".join(self.bss) + "\n"
         return result
         
     def gen_statement(self, node: ASTNode) -> None:
@@ -2148,6 +3236,22 @@ class CodeGenerator:
             self.gen_type_conversion(node)
         elif node.type == ASTType.ASM_STMT:
             self.gen_asm_stmt(node)
+        elif node.type == ASTType.BREAK_STMT:
+            if self.break_labels:
+                self.emit(f"jmp {self.break_labels[-1]}", "text")
+        elif node.type == ASTType.CONTINUE_STMT:
+            if self.continue_labels:
+                self.emit(f"jmp {self.continue_labels[-1]}", "text")
+        elif node.type in (ASTType.STRUCT_DEF, ASTType.CLASS, ASTType.IMPL_BLOCK,
+                           ASTType.TEMPLATE_DECL, ASTType.ENUM_DEF, ASTType.MODULE):
+            for child in node.children:
+                self.gen_statement(child)
+        elif node.type in (ASTType.UNARY_OP, ASTType.INDEX, ASTType.MEMBER_ACCESS,
+                           ASTType.TUPLE, ASTType.LAMBDA, ASTType.STRUCT_LITERAL,
+                           ASTType.ARRAY_LITERAL):
+            # expression used as a statement: evaluate for its side effects
+            self.gen_expression(node)
+            self.emit("add rsp, 8", "text")
             
     def gen_asm_stmt(self, node: ASTNode) -> None:
         """Emit raw inline assembly"""
@@ -2327,7 +3431,7 @@ class CodeGenerator:
             self.emit("pop rcx", "text")
             self.emit("mov dx, cx", "text")
             self.emit("in al, dx", "text")
-            self.emit("movzx rax, al", "text")
+            self.emit("movzx eax, al", "text")
             self.emit("push rax", "text")
         elif name == "port_write16" and len(node.children) >= 2:
             self.gen_expression(node.children[0])
@@ -2342,7 +3446,7 @@ class CodeGenerator:
             self.emit("pop rcx", "text")
             self.emit("mov dx, cx", "text")
             self.emit("in ax, dx", "text")
-            self.emit("movzx rax, ax", "text")
+            self.emit("movzx eax, ax", "text")
             self.emit("push rax", "text")
         elif name == "port_write32" and len(node.children) >= 2:
             self.gen_expression(node.children[0])
@@ -2558,384 +3662,997 @@ class CodeGenerator:
             self.emit("mov rax, 0", "text")
             self.emit("push rax", "text")
             
+    # -- code generation: core semantics -----------------------------------
+    def mem(self, name: str) -> str:
+        """Memory operand for a global symbol, honouring the output format."""
+        if self.output_format in (OutputFormat.FLAT_BINARY, OutputFormat.BOOT_IMAGE):
+            return f"[{name}]"
+        return f"[rel {name}]"
+
+    def ref_of(self, node: Optional[ASTNode]):
+        if node is None:
+            return None
+        ref = node.meta.get('type_ref')
+        if isinstance(ref, TypeRef):
+            return ref
+        if node.type == ASTType.LITERAL:
+            return TypeRef(base=node.data_type)
+        return None
+
+    def size_of(self, ref) -> int:
+        return type_size(ref, self.symbols)
+
+    @staticmethod
+    def reg_for(prefix: str) -> str:
+        return {'byte': 'al', 'word': 'ax', 'dword': 'eax', 'qword': 'rax'}.get(prefix, 'rax')
+
+    @staticmethod
+    def is_pointer(ref) -> bool:
+        return isinstance(ref, TypeRef) and (ref.base in POINTER_TYPES or ref.is_ref)
+
+    def mov_prefix_of(self, ref) -> str:
+        if self.is_pointer(ref):
+            return "qword"
+        size = self.size_of(ref)
+        return {1: "byte", 2: "word", 4: "dword", 8: "qword"}.get(size, "qword")
+
+    def is_float_ref(self, ref) -> bool:
+        return isinstance(ref, TypeRef) and ref.base in (DataType.F32, DataType.F64, DataType.F80)
+
+    def is_float_node(self, node: ASTNode) -> bool:
+        if node is None:
+            return False
+        if node.data_type in (DataType.F32, DataType.F64):
+            return True
+        return self.is_float_ref(self.ref_of(node))
+
+    def new_rodata_label(self, prefix: str) -> str:
+        self.label_counter += 1
+        return f".LC{prefix}{self.label_counter}"
+
+    def emit_float_constant(self, value: float) -> None:
+        import struct as _struct
+        label = self.new_rodata_label("f")
+        bits = _struct.unpack('<Q', _struct.pack('<d', float(value)))[0]
+        self.emit_raw(f"{label}: dq 0x{bits:016x}", "rodata")
+        self.emit(f"mov rax, {self.mem(label)}", "text")
+        self.emit("mov rax, [rax]", "text")
+        self.emit("push rax", "text")
+
+    @staticmethod
+    def bytes_directive(text: str) -> str:
+        return ", ".join(str(b) for b in text.encode('utf-8')) + ", 0"
+
+    def emit_string_constant(self, text: str) -> None:
+        label = self.new_rodata_label("s")
+        self.emit_raw(f'{label}: db {self.bytes_directive(text)}', "rodata")
+        self.emit(f"lea rax, {self.mem(label)}", "text")
+        self.emit("push rax", "text")
+
+    def variable_operand(self, node: ASTNode) -> str:
+        offset = node.meta.get('offset')
+        if node.meta.get('is_global') or offset is None:
+            return self.mem(node.value)
+        return f"[rbp + {offset}]"
+
+    def gen_lambda(self, node: ASTNode) -> None:
+        label = node.meta.get('label') or f"lambda_{self.label_counter}"
+        node.meta['label'] = label
+        params = node.meta.get('param_refs') or []
+        self.emit_raw("", "text")
+        self.emit_raw(f"; lambda {label}", "text")
+        self.emit_raw(f"{label}:", "text")
+        frame = 8 * (len(params) + 4)
+        self.emit("push rbp", "text")
+        self.emit("mov rbp, rsp", "text")
+        self.emit(f"sub rsp, {(frame + 15) & ~15}", "text")
+        arg_regs = ['rdi', 'rsi', 'rdx', 'rcx', 'r8', 'r9']
+        for i, pref in enumerate(params):
+            if i < len(arg_regs):
+                self.emit(f"mov qword [rbp + {-8 * (i + 1)}], {arg_regs[i]}", "text")
+        for i, pname in enumerate(node.meta.get('param_names') or []):
+            node.meta.setdefault('param_offsets', [])
+        body = node.children[0] if node.children else None
+        if body is not None:
+            for stmt in body.children:
+                self.gen_statement(stmt)
+        self.emit("xor eax, eax", "text")
+        self.emit("mov rsp, rbp", "text")
+        self.emit("pop rbp", "text")
+        self.emit("ret", "text")
+
+    # -- statements --------------------------------------------------------
     def gen_switch(self, node: ASTNode) -> None:
-        if len(node.children) < 2:
+        end_label = self.new_label()
+        if not node.children:
             return
-            
         self.gen_expression(node.children[0])
         self.emit("pop rax", "text")
-        
-        end_label = self.new_label()
+        self.emit("mov r11, rax", "text")
+
+        cases = [c for c in node.children[1:] if c is not None and c.type == ASTType.CASE_STMT]
+        default_case = None
         case_labels = []
-        priorities = []
-        
-        # Parse cases with priority
-        for i, case in enumerate(node.children[1:]):
-            case_label = self.new_label()
-            case_labels.append(case_label)
-            
-            # Check for when guard or priority
-            priority = 0
-            if case.children and len(case.children) > 0:
-                for child in case.children:
-                    if child.type == ASTType.PRAGMA and child.value == "priority":
-                        priority = int(child.children[0].value) if child.children else 0
-            
-            if case.children and case.children[0].type == ASTType.LITERAL:
-                # Literal match
-                self.emit(f"cmp rax, {case.children[0].value}", "text")
-                self.emit(f"je {case_label}", "text")
-            elif case.children and case.children[0].type == ASTType.BINARY_OP and case.children[0].value == "when":
-                # Guard condition
-                self.gen_expression(case.children[1])
-                self.emit("pop rbx", "text")
-                self.emit("cmp rbx, 0", "text")
-                self.emit(f"jne {case_label}", "text")
-                
-        if case_labels:
+        for case in cases:
+            label = self.new_label()
+            case_labels.append(label)
+            if case.value == 'default':
+                default_case = (case, label)
+                continue
+            if case.value == 'when' and case.children:
+                self.gen_expression(case.children[0])
+                self.emit("pop rax", "text")
+                self.emit("cmp rax, 0", "text")
+                self.emit(f"jne {label}", "text")
+            elif case.children:
+                self.gen_expression(case.children[0])
+                self.emit("pop rax", "text")
+                self.emit("cmp r11, rax", "text")
+                self.emit(f"je {label}", "text")
+
+        if default_case:
+            self.emit(f"jmp {default_case[1]}", "text")
+        else:
             self.emit(f"jmp {end_label}", "text")
-            
-        for i, case in enumerate(node.children[1:]):
-            self.emit_raw(f"{case_labels[i]}:", "text")
-            if len(case.children) > (1 if case.children[0].type == ASTType.LITERAL else 2):
-                body_start = 1 if case.children[0].type == ASTType.LITERAL else 2
-                for j in range(body_start, len(case.children)):
-                    self.gen_statement(case.children[j])
+
+        for case, label in zip(cases, case_labels):
+            self.emit_raw(f"{label}:", "text")
+            if len(case.children) > 1:
+                self.gen_statement(case.children[1])
             self.emit(f"jmp {end_label}", "text")
-            
+
         self.emit_raw(f"{end_label}:", "text")
-        
+
+    def function_label(self, node: ASTNode) -> str:
+        parent = node.meta.get('parent') or ""
+        name = node.value
+        if parent:
+            base = f"{parent}_{name}"
+        else:
+            base = name
+        params = node.meta.get('param_refs') or []
+        if not parent and name != 'main' and len(self.symbols.find_functions(name)) > 1:
+            sig = "_".join(self._type_tag(p) for p in params)
+            base = f"{name}__{sig}"
+        return base
+
+    @staticmethod
+    def _type_tag(ref) -> str:
+        if ref is None:
+            return "v"
+        if isinstance(ref, TypeRef):
+            if ref.base == DataType.STRUCT:
+                return ref.name.lower()
+            if ref.base == DataType.ARRAY:
+                return "arr"
+            return ref.base.name.lower()
+        return "v"
+
     def gen_function(self, node: ASTNode) -> None:
+        label = node.meta.get('label') or self.function_label(node)
+        node.meta['label'] = label
         self.emit_raw("", "text")
         self.emit_raw(f"; Function: {node.value} (opt: {node.optimization_level.value})", "text")
-        
-        # Emit function label
-        self.emit_raw(f"{node.value}:", "text")
-        
-        # Special prologue for interrupt handlers
+        self.emit_raw(f"{label}:", "text")
+
+        params = node.meta.get('param_refs') or []
+        frame = node.meta.get('frame_size') or node.function_frame_size or 32
+        frame = max(frame, 8 * len(params) + 16)
+        frame = (frame + 15) & ~15
+
         if self.current_function_is_interrupt:
-            self.emit("; Interrupt handler prologue", "text")
-            self.emit("push rax", "text")
-            self.emit("push rcx", "text")
-            self.emit("push rdx", "text")
-            self.emit("push rbx", "text")
-            self.emit("push rbp", "text")
-            self.emit("push rsi", "text")
-            self.emit("push rdi", "text")
-            self.emit("push r8", "text")
-            self.emit("push r9", "text")
-            self.emit("push r10", "text")
-            self.emit("push r11", "text")
+            for reg in ("rax", "rcx", "rdx", "rbx", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11"):
+                self.emit(f"push {reg}", "text")
             self.emit("pushfq", "text")
         else:
             self.emit("push rbp", "text")
             self.emit("mov rbp, rsp", "text")
-            self.emit(f"sub rsp, {node.function_frame_size}", "text")
-            
-        # Parameter handling
+            self.emit(f"sub rsp, {frame}", "text")
+
         arg_regs = ['rdi', 'rsi', 'rdx', 'rcx', 'r8', 'r9']
-        for i, ptype in enumerate(node.function_params):
+        for i, pref in enumerate(params):
             if i < len(arg_regs):
-                offset = -8 - (i * 8)
-                mov_prefix = self.get_mov_prefix(ptype)
-                self.emit(f"mov {mov_prefix} [rbp + {offset}], {arg_regs[i]}", "text")
-                
-        # Function body
+                offset = node.meta.get('param_offsets', [])[i] if node.meta.get('param_offsets') else -(8 * (i + 1))
+                prefix = "qword" if self.is_float_ref(pref) else self.mov_prefix_of(pref)
+                src = arg_regs[i]
+                if prefix != "qword":
+                    src = {'byte': 'dil', 'word': 'di', 'dword': 'edi'}[prefix]
+                self.emit(f"mov {prefix} [rbp + {offset}], {src}", "text")
+
         for child in node.children:
             self.gen_statement(child)
-            
-        # Epilogue
-        if self.current_function_is_interrupt:
-            self.emit("; Interrupt handler epilogue", "text")
-            self.emit("popfq", "text")
-            self.emit("pop r11", "text")
-            self.emit("pop r10", "text")
-            self.emit("pop r9", "text")
-            self.emit("pop r8", "text")
-            self.emit("pop rdi", "text")
-            self.emit("pop rsi", "text")
-            self.emit("pop rbp", "text")
-            self.emit("pop rbx", "text")
-            self.emit("pop rdx", "text")
-            self.emit("pop rcx", "text")
-            self.emit("pop rax", "text")
-            self.emit("iretq", "text")  # IRET for interrupt return
-            return
-            
+
         if node.function_return != DataType.VOID:
             self.emit("xor eax, eax", "text")
-        self.emit("mov rsp, rbp", "text")
-        self.emit("pop rbp", "text")
-        
-        if self.current_function_is_kernel:
-            self.emit("ret", "text")  # Normal return for kernel functions
+        if self.current_function_is_interrupt:
+            self.emit("popfq", "text")
+            for reg in ("r11", "r10", "r9", "r8", "rdi", "rsi", "rbp", "rbx", "rdx", "rcx", "rax"):
+                self.emit(f"pop {reg}", "text")
+            self.emit("iretq", "text")
         else:
+            self.emit("mov rsp, rbp", "text")
+            self.emit("pop rbp", "text")
             self.emit("ret", "text")
-            
+
         self.current_function_is_interrupt = False
         self.current_function_is_kernel = False
-        
+
+    # -- calls -------------------------------------------------------------
+    def resolve_callee(self, node: ASTNode) -> str:
+        name = node.value
+        candidates = self.symbols.find_functions(name)
+        if not candidates:
+            return name
+        if len(candidates) == 1:
+            return candidates[0].meta.get('label') or self.function_label(candidates[0])
+        args = node.children[1:]
+        floats = [self.is_float_node(a) for a in args]
+        best = None
+        for cand in candidates:
+            params = cand.meta.get('param_refs') or []
+            if len(params) != len(args):
+                continue
+            score = 0
+            for pref, arg_float in zip(params, floats):
+                if self.is_float_ref(pref) == arg_float:
+                    score += 1
+            if best is None or score > best[0]:
+                best = (score, cand)
+        if best:
+            return best[1].meta.get('label') or self.function_label(best[1])
+        return name
+
     def gen_call(self, node: ASTNode) -> None:
-        if not node.children:
+        arg_regs = ['rdi', 'rsi', 'rdx', 'rcx', 'r8', 'r9']
+
+        if node.type == ASTType.METHOD_CALL:
+            receiver = node.children[0] if node.children else None
+            args = node.children[1:]
+            recv_ref = self.ref_of(receiver) if receiver is not None else None
+            owner = recv_ref.name if isinstance(recv_ref, TypeRef) else ""
+            method = node.value
+            candidates = [f for f in self.symbols.functions
+                          if f.value == method and (f.meta.get('parent') or "") == owner]
+            if not candidates:
+                candidates = [f for f in self.symbols.functions if f.value == method]
+            is_static = method == 'new' or (receiver is not None and receiver.meta.get('is_type_name'))
+            if not candidates and not owner:
+                self.emit(f"; method call '.{method}' has no known owner type", "text")
+                self.emit("push 0", "text")
+                return
+            if is_static:
+                if len(args) > 5:
+                    self.emit("; NOTE: more than 5 arguments to a constructor are not supported", "text")
+                for arg in reversed(args):
+                    self.gen_expression(arg)
+                for i in range(min(len(args), 5)):
+                    self.emit(f"pop {arg_regs[i + 1]}", "text")
+                scratch = self.symbols.struct_size(owner) if owner else 64
+                scratch = (max(scratch, 8) + 15) & ~15
+                self.emit(f"sub rsp, {scratch}", "text")
+                self.emit("mov rdi, rsp", "text")
+                self.emit(f"call {owner}_{method}", "text")
+                self.emit(f"add rsp, {scratch}", "text")
+                self.emit("push rax", "text")
+                return
+            target = candidates[0].meta.get('label') if candidates else f"{owner}_{method}"
+            params = (candidates[0].meta.get('param_refs') if candidates else []) or []
+            self_mode = candidates[0].meta.get('self_mode') if candidates else ''
+
+            # evaluate arguments first, then the receiver address
+            for arg in reversed(args):
+                self.gen_expression(arg)
+            for i in range(min(len(args), 5)):
+                self.emit(f"pop {arg_regs[i + 1]}", "text")
+
+            if receiver is not None:
+                if self_mode in ('ref', 'ref_mut') or receiver.type in (ASTType.INDEX, ASTType.MEMBER_ACCESS):
+                    self.gen_address(receiver)
+                    self.emit("mov rdi, rax", "text")
+                else:
+                    self.gen_expression(receiver)
+                    self.emit("pop rdi", "text")
+            self.emit(f"call {target}", "text")
+            self.emit("push rax", "text")
             return
-            
-        func_name = node.value
+
         args = node.children[1:] if len(node.children) > 1 else []
-        
+        target = self.resolve_callee(node)
+
+        # fill in default parameter values
+        callee = None
+        for cand in self.symbols.find_functions(node.value):
+            if len(cand.meta.get('param_refs') or []) == len(args):
+                callee = cand
+                break
+        if callee is not None:
+            defaults = callee.meta.get('param_defaults') or []
+            if len(defaults) > len(args):
+                for d in defaults[len(args):]:
+                    args = list(args) + ([d] if d is not None else [])
+
+        if len(args) > 6:
+            self.emit("; NOTE: more than 6 arguments are not yet supported", "text")
         for arg in reversed(args):
             self.gen_expression(arg)
-            
-        arg_regs = ['rdi', 'rsi', 'rdx', 'rcx', 'r8', 'r9']
         for i in range(min(len(args), 6)):
             self.emit(f"pop {arg_regs[i]}", "text")
-            
-        if len(args) > 6:
-            self.emit("; Additional args on stack", "text")
-            
-        self.emit(f"call {func_name}", "text")
+        self.emit(f"call {target}", "text")
         self.emit("push rax", "text")
-        
-    def gen_assign(self, node: ASTNode) -> None:
-        if len(node.children) < 2:
-            return
-            
-        self.gen_expression(node.children[1])
-        self.emit("pop rax", "text")
-        
-        lhs = node.children[0]
-        if lhs.type == ASTType.VARIABLE:
-            sym = self.symbols.lookup(lhs.value)
-            if sym and not sym.is_global:
-                mov_prefix = self.get_mov_prefix(sym.type)
-                self.emit(f"mov {mov_prefix} [rbp + {sym.stack_offset}], rax", "text")
-            elif sym and sym.is_imported:
-                self.emit(f"; Imported symbol: {lhs.value} from {sym.module_name}", "text")
-                mov_prefix = self.get_mov_prefix(sym.type) if sym else "qword"
-                self.emit(f"mov {mov_prefix} [rel {lhs.value}], rax", "text")
+
+    # -- assignment --------------------------------------------------------
+    def gen_address(self, node: ASTNode) -> None:
+        """Emit code that leaves the address of an lvalue in rax."""
+        if node.type == ASTType.VARIABLE:
+            if node.meta.get('is_global') or node.meta.get('offset') is None:
+                self.emit(f"lea rax, {self.mem(node.value)}", "text")
             else:
-                mov_prefix = self.get_mov_prefix(sym.type) if sym else "qword"
-                self.emit(f"mov {mov_prefix} [rel {lhs.value}], rax", "text")
-                
-    def gen_return(self, node: ASTNode) -> None:
-        if node.children:
+                self.emit(f"lea rax, [rbp + {node.meta['offset']}]", "text")
+            return
+        if node.type == ASTType.MEMBER_ACCESS and node.children:
+            base = node.children[0]
+            base_ref = self.ref_of(base)
+            if self.is_pointer(base_ref):
+                self.gen_expression(base)
+                self.emit("pop rax", "text")
+            else:
+                self.gen_address(base)
+            struct_name = base_ref.name if isinstance(base_ref, TypeRef) else ""
+            found = self.symbols.field_offset(struct_name, node.value)
+            if found:
+                self.emit(f"add rax, {found[0]}", "text")
+            return
+        if node.type == ASTType.INDEX and len(node.children) >= 2:
+            base, index = node.children[0], node.children[1]
+            base_ref = self.ref_of(base)
+            if self.is_pointer(base_ref):
+                self.gen_expression(base)
+                self.emit("pop rax", "text")
+            else:
+                self.gen_address(base)
+            self.emit("push rax", "text")
+            self.gen_expression(index)
+            self.emit("pop rbx", "text")
+            self.emit("pop rax", "text")
+            elem = self.ref_of(base)
+            esize = 8
+            if isinstance(elem, TypeRef) and elem.elem is not None:
+                esize = self.size_of(elem.elem)
+            if esize != 1:
+                self.emit(f"imul rax, {esize}", "text")
+            self.emit("add rax, rbx", "text")
+            return
+        if node.type == ASTType.UNARY_OP and node.value == '*':
             self.gen_expression(node.children[0])
             self.emit("pop rax", "text")
+            return
+        self.emit("xor eax, eax", "text")
+
+    def gen_store_to(self, node: ASTNode, prefix: str = "qword") -> None:
+        """Store rax through an lvalue."""
+        reg = self.reg_for(prefix)
+        if node.type == ASTType.VARIABLE and not node.meta.get('is_global') \
+                and node.meta.get('offset') is not None:
+            self.emit(f"mov {prefix} [rbp + {node.meta['offset']}], {reg}", "text")
+            return
+        self.gen_address(node)
+        self.emit("mov rbx, rax", "text")
+        self.emit("pop rax", "text")
+        self.emit(f"mov {prefix} [rbx], {reg}", "text")
+
+    def gen_assign(self, node: ASTNode) -> None:
+        meta = node.meta
+        lhs = node.children[0] if node.children else None
+
+        # tuple destructuring: let (q, r) = f()
+        if meta.get('tuple_names'):
+            if len(node.children) > 1:
+                self.gen_expression(node.children[1])
+                self.emit("pop rax", "text")
+                self.emit("mov rdx, rdx", "text")
+            names = meta['tuple_names']
+            regs = ['rax', 'rdx']
+            for i, name in enumerate(names[:2]):
+                sym = self.symbols.lookup(name)
+                offset = sym.stack_offset if sym else -(8 * (i + 1))
+                self.emit(f"mov qword [rbp + {offset}], {regs[i]}", "text")
+            return
+
+        if lhs is None:
+            return
+
+        ref = meta.get('type_ref') or self.ref_of(lhs)
+        value = node.children[1] if len(node.children) > 1 else None
+
+        # declaration of a static/global
+        if meta.get('is_static') and lhs.type == ASTType.VARIABLE:
+            if value is not None and value.type == ASTType.LITERAL and not value.meta.get('is_string'):
+                self.emit_raw(f"{lhs.value}: dq {value.value}", "data")
+            elif value is not None and value.type == ASTType.LITERAL and value.meta.get('is_string'):
+                label = self.new_rodata_label("str")
+                self.emit_raw(f'{label}: db {self.bytes_directive(value.value)}', "rodata")
+                self.emit_raw(f"{lhs.value}: dq {label}", "data")
+            else:
+                self.emit_raw(f"{lhs.value}: resq 1", "bss")
+            return
+
+        # array declaration with an initialiser
+        if value is not None and value.type == ASTType.ARRAY_LITERAL:
+            self.gen_array_init(lhs, value)
+            return
+
+        # struct literal
+        if value is not None and value.type == ASTType.STRUCT_LITERAL:
+            self.gen_struct_init(lhs, value)
+            return
+
+        if value is not None:
+            self.gen_expression(value)
+            self.emit("pop rax", "text")
+        elif isinstance(ref, TypeRef) and ref.base == DataType.ARRAY and lhs.type == ASTType.VARIABLE \
+                and not lhs.meta.get('is_global') and lhs.meta.get('offset') is not None:
+            size = self.size_of(ref)
+            self.emit(f"lea rdi, [rbp + {lhs.meta['offset']}]", "text")
+            self.emit(f"mov rcx, {size}", "text")
+            self.emit("xor eax, eax", "text")
+            self.emit("rep stosb", "text")
+            self.emit("xor eax, eax", "text")
+            return
         else:
             self.emit("xor eax, eax", "text")
-            
+
+        prefix = self.mov_prefix_of(ref)
+        self.gen_store_to(lhs, prefix)
+
+    def gen_array_init(self, lhs: ASTNode, literal: ASTNode) -> None:
+        ref = self.ref_of(lhs)
+        elem = ref.elem if isinstance(ref, TypeRef) and ref.elem is not None else TypeRef(base=DataType.U64)
+        esize = self.size_of(elem)
+        prefix = self.mov_prefix_of(elem)
+        elements = literal.children
+        repeat = literal.meta.get('repeat')
+
+        self.gen_address(lhs)
+        self.emit("push rax", "text")
+
+        count = repeat if repeat else len(elements)
+        for i in range(count):
+            element = elements[0] if repeat else (elements[i] if i < len(elements) else None)
+            if element is None:
+                continue
+            self.gen_expression(element)
+            self.emit("pop rax", "text")
+            self.emit("mov rbx, [rsp]", "text")
+            self.emit(f"mov {prefix} [rbx + {i * esize}], {self.reg_for(prefix)}", "text")
+
+        self.emit("pop rax", "text")
+
+    def gen_struct_init(self, lhs: ASTNode, literal: ASTNode) -> None:
+        ref = self.ref_of(lhs)
+        struct_name = ref.name if isinstance(ref, TypeRef) else literal.value
+        layout = self.symbols.struct_layout(struct_name)
+        self.gen_address(lhs)
+        self.emit("push rax", "text")
+        for index, field_value in enumerate(literal.children):
+            field_name = field_value.meta.get('field_name')
+            offset = index * 8
+            field_ref = None
+            if layout and field_name:
+                found = self.symbols.field_offset(struct_name, field_name)
+                if found:
+                    offset, field_ref = found
+            elif layout and index < len(layout['fields']):
+                offset = layout['fields'][index][2]
+                field_ref = layout['fields'][index][1]
+            self.gen_expression(field_value)
+            self.emit("pop rax", "text")
+            self.emit("mov rbx, [rsp]", "text")
+            prefix = self.mov_prefix_of(field_ref) if field_ref else "qword"
+            self.emit(f"mov {prefix} [rbx + {offset}], {self.reg_for(prefix)}", "text")
+        self.emit("pop rax", "text")
+
+    def gen_return(self, node: ASTNode) -> None:
+        if node.children:
+            value = node.children[0]
+            self.gen_expression(value)
+            self.emit("pop rax", "text")
+            if value.type == ASTType.TUPLE and len(value.children) > 1:
+                self.gen_expression(value.children[1])
+                self.emit("pop rdx", "text")
+                self.gen_expression(value.children[0])
+                self.emit("pop rax", "text")
+        else:
+            self.emit("xor eax, eax", "text")
+
         if self.current_function_is_interrupt:
             self.emit("jmp .interrupt_return", "text")
         else:
             self.emit("mov rsp, rbp", "text")
             self.emit("pop rbp", "text")
             self.emit("ret", "text")
-            
+
     def gen_if(self, node: ASTNode) -> None:
-        else_label = self.new_label()
         end_label = self.new_label()
-        
+        else_label = self.new_label()
+
         self.gen_expression(node.children[0])
         self.emit("pop rax", "text")
-        self.emit("cmp rax, 0", "text")
-        self.emit(f"je {else_label}", "text")
-        
-        if len(node.children) > 1:
+        self.emit("test rax, rax", "text")
+        self.emit(f"jz {else_label}", "text")
+
+        if len(node.children) > 1 and node.children[1] is not None:
             self.gen_statement(node.children[1])
         self.emit(f"jmp {end_label}", "text")
-        
         self.emit_raw(f"{else_label}:", "text")
-        if len(node.children) > 2:
+
+        if len(node.children) > 2 and node.children[2] is not None:
             self.gen_statement(node.children[2])
-            
         self.emit_raw(f"{end_label}:", "text")
-        
+
     def gen_while(self, node: ASTNode) -> None:
         start_label = self.new_label()
         end_label = self.new_label()
-        
+        self.break_labels.append(end_label)
+        self.continue_labels.append(start_label)
+
         self.emit_raw(f"{start_label}:", "text")
         self.gen_expression(node.children[0])
         self.emit("pop rax", "text")
-        self.emit("cmp rax, 0", "text")
-        self.emit(f"je {end_label}", "text")
-        
-        if len(node.children) > 1:
+        self.emit("test rax, rax", "text")
+        self.emit(f"jz {end_label}", "text")
+        if len(node.children) > 1 and node.children[1] is not None:
             self.gen_statement(node.children[1])
         self.emit(f"jmp {start_label}", "text")
-        
         self.emit_raw(f"{end_label}:", "text")
-        
+
+        self.break_labels.pop()
+        self.continue_labels.pop()
+
     def gen_for(self, node: ASTNode) -> None:
+        if node.value == "cstyle":
+            self.gen_for_cstyle(node)
+        elif node.value == "each":
+            self.gen_for_each(node)
+        else:
+            self.gen_for_range(node)
+
+    def gen_for_range(self, node: ASTNode) -> None:
+        var_node, start, end, step, body = (node.children + [None] * 5)[:5]
         start_label = self.new_label()
         end_label = self.new_label()
-        
-        # Handle SIMD vectorization hint
-        if node.simd_level != SIMDLevel.NONE:
-            self.emit(f"; Vectorized loop with {node.simd_level.name}", "text")
-            # Align loop for SIMD
-            self.emit("align 16", "text")
-        
-        # Handle loop unrolling hint
-        if node.unroll_factor > 0:
-            self.emit(f"; Unrolled loop with factor {node.unroll_factor}", "text")
-        
-        if len(node.children) > 0 and node.children[0]:
-            self.gen_statement(node.children[0])
-            
+        continue_label = self.new_label()
+        self.break_labels.append(end_label)
+        self.continue_labels.append(continue_label)
+
+        var_name = var_node.value if var_node is not None else "i"
+        sym = self.symbols.lookup(var_name)
+        offset = sym.stack_offset if sym else -8
+        var_node = var_node or ASTNode(ASTType.VARIABLE, var_name)
+        var_node.meta.setdefault('offset', offset)
+        var_node.meta.setdefault('is_global', False)
+
+        self.gen_expression(start)
+        self.emit("pop rax", "text")
+        self.emit(f"mov qword [rbp + {offset}], rax", "text")
+        self.gen_expression(end)
+        self.emit("pop rbx", "text")
+        self.gen_expression(step)
+        self.emit("pop r10", "text")
+
         self.emit_raw(f"{start_label}:", "text")
-        
-        if len(node.children) > 1 and node.children[1]:
-            self.gen_expression(node.children[1])
-            self.emit("pop rax", "text")
-            self.emit("cmp rax, 0", "text")
-            self.emit(f"je {end_label}", "text")
-        
-        if len(node.children) > 3 and node.children[3]:
-            self.gen_statement(node.children[3])
-            
-        if len(node.children) > 2 and node.children[2]:
-            self.gen_statement(node.children[2])
-            
+        self.emit("mov rcx, r10", "text")
+        self.emit("test rcx, rcx", "text")
+        positive = self.new_label()
+        self.emit(f"jns {positive}", "text")
+        self.emit(f"mov rax, [rbp + {offset}]", "text")
+        self.emit("cmp rax, rbx", "text")
+        self.emit(f"jle {end_label}", "text")
+        self.emit(f"jmp {continue_label}", "text")
+        self.emit_raw(f"{positive}:", "text")
+        self.emit(f"mov rax, [rbp + {offset}]", "text")
+        self.emit("cmp rax, rbx", "text")
+        self.emit(f"jge {end_label}", "text")
+        self.emit_raw(f"{continue_label}:", "text")
+
+        self.emit(f"mov rax, [rbp + {offset}]", "text")
+        self.emit("push rax", "text")
+        self.emit(f"mov qword [rbp + {offset}], rax", "text")
+
+        if body is not None:
+            self.gen_statement(body)
+
+        self.emit(f"mov rax, [rbp + {offset}]", "text")
+        self.emit("add rax, r10", "text")
+        self.emit(f"mov qword [rbp + {offset}], rax", "text")
         self.emit(f"jmp {start_label}", "text")
         self.emit_raw(f"{end_label}:", "text")
-        
-    def gen_with(self, node: ASTNode) -> None:
-        mutex_name = f"mutex_{self.label_counter}"
-        spin_label = self.new_label()
-        
-        self.emit_raw(f"{spin_label}:", "text")
-        self.emit("mov al, 1", "text")
-        self.emit(f"xchg byte [rel {mutex_name}], al", "text")
-        self.emit("test al, al", "text")
-        self.emit(f"jnz {spin_label}", "text")
-        self.emit("mfence", "text")
-        
-        if len(node.children) > 1 and node.children[1]:
-            self.gen_statement(node.children[1])
-            
-        self.emit(f"mov byte [rel {mutex_name}], 0", "text")
-        self.emit("mfence", "text")
-        
-        self.emit_raw(f"{mutex_name}: resb 8", "bss")
-        
-    def gen_expression(self, node: ASTNode) -> None:
-        if not node:
-            return
-            
-        if node.type == ASTType.LITERAL:
-            self.emit(f"push {node.value}", "text")
-        elif node.type == ASTType.VARIABLE:
-            sym = self.symbols.lookup(node.value)
-            if sym and not sym.is_global:
-                mov_prefix = self.get_mov_prefix(sym.type)
-                self.emit(f"push {mov_prefix} [rbp + {sym.stack_offset}]", "text")
-            elif sym and sym.is_imported:
-                self.emit(f"; Imported symbol: {node.value} from {sym.module_name}", "text")
-                self.emit(f"push qword [rel {node.value}]", "text")
-            else:
-                mov_prefix = self.get_mov_prefix(sym.type) if sym else "qword"
-                self.emit(f"push {mov_prefix} [rel {node.value}]", "text")
-        elif node.type == ASTType.BINARY_OP:
-            self.gen_expression(node.children[0])
-            self.gen_expression(node.children[1])
-            self.emit("pop rbx", "text")
-            self.emit("pop rax", "text")
-            
-            if node.value == "+":
-                self.emit("add rax, rbx", "text")
-            elif node.value == "-":
-                self.emit("sub rax, rbx", "text")
-            elif node.value == "*":
-                self.emit("imul rax, rbx", "text")
-            elif node.value == "/":
-                self.emit("xor rdx, rdx", "text")
-                self.emit("div rbx", "text")
-            elif node.value == "%":
-                self.emit("xor rdx, rdx", "text")
-                self.emit("div rbx", "text")
-                self.emit("mov rax, rdx", "text")
-            elif node.value == "&":
-                self.emit("and rax, rbx", "text")
-            elif node.value == "|":
-                self.emit("or rax, rbx", "text")
-            elif node.value == "^":
-                self.emit("xor rax, rbx", "text")
-            elif node.value == "<<":
-                self.emit("mov rcx, rbx", "text")
-                self.emit("shl rax, cl", "text")
-            elif node.value == ">>":
-                self.emit("mov rcx, rbx", "text")
-                self.emit("shr rax, cl", "text")
-            elif node.value == "==":
-                self.emit("cmp rax, rbx", "text")
-                self.emit("sete al", "text")
-                self.emit("movzx rax, al", "text")
-            elif node.value == "!=":
-                self.emit("cmp rax, rbx", "text")
-                self.emit("setne al", "text")
-                self.emit("movzx rax, al", "text")
-            elif node.value == "<":
-                self.emit("cmp rax, rbx", "text")
-                self.emit("setl al", "text")
-                self.emit("movzx rax, al", "text")
-            elif node.value == "<=":
-                self.emit("cmp rax, rbx", "text")
-                self.emit("setle al", "text")
-                self.emit("movzx rax, al", "text")
-            elif node.value == ">":
-                self.emit("cmp rax, rbx", "text")
-                self.emit("setg al", "text")
-                self.emit("movzx rax, al", "text")
-            elif node.value == ">=":
-                self.emit("cmp rax, rbx", "text")
-                self.emit("setge al", "text")
-                self.emit("movzx rax, al", "text")
-            elif node.value == "&&":
-                false_label = self.new_label()
-                end_label = self.new_label()
-                self.emit("test rax, rax", "text")
-                self.emit(f"jz {false_label}", "text")
-                self.emit("test rbx, rbx", "text")
-                self.emit(f"jz {false_label}", "text")
-                self.emit("mov rax, 1", "text")
-                self.emit(f"jmp {end_label}", "text")
-                self.emit_raw(f"{false_label}:", "text")
-                self.emit("mov rax, 0", "text")
-                self.emit_raw(f"{end_label}:", "text")
-            elif node.value == "||":
-                true_label = self.new_label()
-                end_label = self.new_label()
-                self.emit("test rax, rax", "text")
-                self.emit(f"jnz {true_label}", "text")
-                self.emit("test rbx, rbx", "text")
-                self.emit(f"jnz {true_label}", "text")
-                self.emit("mov rax, 0", "text")
-                self.emit(f"jmp {end_label}", "text")
-                self.emit_raw(f"{true_label}:", "text")
-                self.emit("mov rax, 1", "text")
-                self.emit_raw(f"{end_label}:", "text")
-                
-            self.emit("push rax", "text")
-        elif node.type == ASTType.TYPE_CONVERSION:
-            self.gen_type_conversion(node)
-        elif node.type == ASTType.CALL:
-            self.gen_call(node)
-        elif node.type == ASTType.BUILTIN_CALL:
-            self.gen_builtin(node)
-        elif node.type == ASTType.METHOD_CALL:
-            self.gen_call(node)
-        elif node.type == ASTType.BLOCK_ARRAY_METHOD:
-            self.gen_block_array_method(node)
-        elif node.type == ASTType.SIMD_OPERATION:
-            self.gen_simd_operation(node)
-        elif node.type == ASTType.ASM_STMT:
-            self.gen_asm_stmt(node)
-        else:
-            self.emit("push 0", "text")
 
-# ============================================================================
-# Compiler Main
-# ============================================================================
+        self.break_labels.pop()
+        self.continue_labels.pop()
+
+    def gen_for_each(self, node: ASTNode) -> None:
+        var_node, iterable, body = (node.children + [None] * 3)[:3]
+        start_label = self.new_label()
+        end_label = self.new_label()
+        self.break_labels.append(end_label)
+        self.continue_labels.append(start_label)
+
+        var_name = var_node.value if var_node is not None else "ch"
+        sym = self.symbols.lookup(var_name)
+        offset = sym.stack_offset if sym else -8
+
+        self.gen_expression(iterable)
+        self.emit("pop rbx", "text")
+        self.emit_raw(f"{start_label}:", "text")
+        self.emit("movzx rax, byte [rbx]", "text")
+        self.emit("test rax, rax", "text")
+        self.emit(f"jz {end_label}", "text")
+        self.emit(f"mov qword [rbp + {offset}], rax", "text")
+        self.emit("inc rbx", "text")
+        self.emit("push rbx", "text")
+        if body is not None:
+            self.gen_statement(body)
+        self.emit("pop rbx", "text")
+        self.emit(f"jmp {start_label}", "text")
+        self.emit_raw(f"{end_label}:", "text")
+
+        self.break_labels.pop()
+        self.continue_labels.pop()
+
+    def gen_for_cstyle(self, node: ASTNode) -> None:
+        init, cond, step, body = (node.children + [None] * 4)[:4]
+        start_label = self.new_label()
+        end_label = self.new_label()
+        continue_label = self.new_label()
+        self.break_labels.append(end_label)
+        self.continue_labels.append(continue_label)
+
+        if init is not None:
+            self.gen_statement(init)
+        self.emit_raw(f"{start_label}:", "text")
+        if cond is not None:
+            self.gen_expression(cond)
+            self.emit("pop rax", "text")
+            self.emit("test rax, rax", "text")
+            self.emit(f"jz {end_label}", "text")
+        if body is not None:
+            self.gen_statement(body)
+        self.emit_raw(f"{continue_label}:", "text")
+        if step is not None:
+            self.gen_statement(step)
+        self.emit(f"jmp {start_label}", "text")
+        self.emit_raw(f"{end_label}:", "text")
+
+        self.break_labels.pop()
+        self.continue_labels.pop()
+
+    def gen_with(self, node: ASTNode) -> None:
+        if len(node.children) > 1 and node.children[1] is not None:
+            self.gen_statement(node.children[1])
+
+    # -- expressions -------------------------------------------------------
+    def gen_expression(self, node: Optional[ASTNode]) -> None:
+        if node is None:
+            self.emit("push 0", "text")
+            return
+
+        t = node.type
+
+        if t == ASTType.LITERAL:
+            if node.meta.get('is_string'):
+                self.emit_string_constant(node.value)
+            elif node.data_type == DataType.F64 or ('.' in str(node.value) and not str(node.value).startswith('0x')):
+                try:
+                    self.emit_float_constant(float(node.value))
+                except ValueError:
+                    self.emit("push 0", "text")
+            elif node.data_type == DataType.CHAR and 'char_value' in node.meta:
+                self.emit(f"mov rax, {node.meta['char_value']}", "text")
+                self.emit("push rax", "text")
+            else:
+                try:
+                    value = int(str(node.value), 0)
+                except ValueError:
+                    value = 0
+                self.emit(f"mov rax, {value}", "text")
+                self.emit("push rax", "text")
+            return
+
+        if t == ASTType.VARIABLE:
+            ref = self.ref_of(node)
+            if ref is not None and ref.base in (DataType.ARRAY, DataType.STRUCT) \
+                    and not self.is_pointer(ref):
+                self.gen_address(node)
+                self.emit("push rax", "text")
+                return
+            operand = self.variable_operand(node)
+            prefix = self.mov_prefix_of(ref)
+            self.emit(f"mov {self.reg_for(prefix)}, {prefix} {operand}", "text")
+            if prefix == "byte":
+                self.emit("movzx eax, al", "text")
+            elif prefix == "word":
+                self.emit("movzx eax, ax", "text")
+            self.emit("push rax", "text")
+            return
+
+        if t == ASTType.BINARY_OP:
+            self.gen_binary(node)
+            return
+
+        if t == ASTType.UNARY_OP:
+            self.gen_unary(node)
+            return
+
+        if t == ASTType.INDEX:
+            ref = self.ref_of(node)
+            if ref is not None and ref.base in (DataType.ARRAY, DataType.STRUCT) \
+                    and not self.is_pointer(ref):
+                self.gen_address(node)
+                self.emit("push rax", "text")
+                return
+            self.gen_address(node)
+            self.emit("mov rbx, rax", "text")
+            prefix = self.mov_prefix_of(ref)
+            self.emit(f"mov {self.reg_for(prefix)}, {prefix} [rbx]", "text")
+            if prefix == "byte":
+                self.emit("movzx eax, al", "text")
+            elif prefix == "word":
+                self.emit("movzx eax, ax", "text")
+            self.emit("push rax", "text")
+            return
+
+        if t == ASTType.MEMBER_ACCESS:
+            ref = self.ref_of(node)
+            if ref is None:
+                base_ref = self.ref_of(node.children[0]) if node.children else None
+                struct_name = base_ref.name if isinstance(base_ref, TypeRef) else ""
+                ref = self.symbols.field_ref(struct_name, node.value)
+            if ref is not None and ref.base in (DataType.ARRAY, DataType.STRUCT) \
+                    and not self.is_pointer(ref):
+                self.gen_address(node)
+                self.emit("push rax", "text")
+                return
+            self.gen_address(node)
+            self.emit("mov rbx, rax", "text")
+            prefix = self.mov_prefix_of(ref)
+            self.emit(f"mov {self.reg_for(prefix)}, {prefix} [rbx]", "text")
+            if prefix == "byte":
+                self.emit("movzx eax, al", "text")
+            elif prefix == "word":
+                self.emit("movzx eax, ax", "text")
+            self.emit("push rax", "text")
+            return
+
+        if t == ASTType.CALL or t == ASTType.METHOD_CALL:
+            self.gen_call(node)
+            return
+
+        if t == ASTType.BUILTIN_CALL:
+            self.gen_builtin(node)
+            return
+
+        if t == ASTType.TYPE_CONVERSION:
+            self.gen_conversion(node)
+            return
+
+        if t == ASTType.ARRAY_LITERAL:
+            self.emit("; array literal used as a value", "text")
+            self.emit("push 0", "text")
+            return
+
+        if t == ASTType.STRUCT_LITERAL:
+            self.emit(f"; struct literal {node.value}", "text")
+            self.emit("push 0", "text")
+            return
+
+        if t == ASTType.TUPLE:
+            if node.children:
+                self.gen_expression(node.children[0])
+            else:
+                self.emit("push 0", "text")
+            return
+
+        if t == ASTType.LAMBDA:
+            label = node.meta.get('label')
+            if not label:
+                label = f"lambda_{self.label_counter}"
+                self.label_counter += 1
+                node.meta['label'] = label
+                self.pending_lambdas.append(node)
+            self.emit(f"lea rax, {self.mem(label)}", "text")
+            self.emit("push rax", "text")
+            return
+
+        if t == ASTType.SIMD_OPERATION:
+            self.emit(f"; SIMD operation '{node.value}' is not yet implemented", "text")
+            self.emit("push 0", "text")
+            return
+
+        if t == ASTType.BLOCK_ARRAY_METHOD:
+            self.emit(f"; BlockArray.{node.value}() is not yet implemented", "text")
+            self.emit("push 0", "text")
+            return
+
+        if t == ASTType.BLOCK_ARRAY_TYPE:
+            self.emit("; BlockArray value", "text")
+            self.emit("push 0", "text")
+            return
+
+        self.emit(f"; unsupported expression node {t.name}", "text")
+        self.emit("push 0", "text")
+
+    def gen_unary(self, node: ASTNode) -> None:
+        op = node.value
+        operand = node.children[0] if node.children else None
+        if op == '&':
+            self.gen_address(operand)
+            self.emit("push rax", "text")
+            return
+        if op == '*':
+            self.gen_expression(operand)
+            self.emit("pop rbx", "text")
+            ref = self.ref_of(node)
+            prefix = self.mov_prefix_of(ref)
+            self.emit(f"mov {self.reg_for(prefix)}, {prefix} [rbx]", "text")
+            if prefix == "byte":
+                self.emit("movzx eax, al", "text")
+            elif prefix == "word":
+                self.emit("movzx eax, ax", "text")
+            self.emit("push rax", "text")
+            return
+        if op in ('++', '--'):
+            self.gen_expression(operand)
+            self.emit("pop rax", "text")
+            self.emit("add rax, 1" if op == '++' else "sub rax, 1", "text")
+            self.emit("push rax", "text")
+            self.gen_address(operand)
+            self.emit("mov rbx, rax", "text")
+            self.emit("pop rax", "text")
+            self.emit("mov qword [rbx], rax", "text")
+            self.emit("push rax", "text")
+            return
+
+        self.gen_expression(operand)
+        self.emit("pop rax", "text")
+        if op == '-':
+            if self.is_float_node(operand):
+                self.emit("mov rbx, 0x8000000000000000", "text")
+                self.emit("xor rax, rbx", "text")
+            else:
+                self.emit("neg rax", "text")
+        elif op in ('not', '!'):
+            self.emit("test rax, rax", "text")
+            self.emit("sete al", "text")
+            self.emit("movzx eax, al", "text")
+        elif op == '~':
+            self.emit("not rax", "text")
+        self.emit("push rax", "text")
+
+    def gen_binary(self, node: ASTNode) -> None:
+        op = node.value
+        left, right = node.children[0], node.children[1]
+        left_float = self.is_float_node(left)
+        right_float = self.is_float_node(right)
+        use_float = left_float or right_float
+
+        if op in ('and', '&&'):
+            op = '&&'
+        elif op in ('or', '||'):
+            op = '||'
+
+        self.gen_expression(left)
+        self.gen_expression(right)
+        self.emit("pop rbx", "text")
+        self.emit("pop rax", "text")
+
+        if op in ('&&', '||'):
+            self.emit("test rax, rax", "text")
+            self.emit("setne al", "text")
+            self.emit("movzx eax, al", "text")
+            self.emit("test rbx, rbx", "text")
+            self.emit("setne bl", "text")
+            self.emit("movzx ebx, bl", "text")
+            self.emit("and rax, rbx" if op == '&&' else "or rax, rbx", "text")
+            self.emit("push rax", "text")
+            return
+
+        if use_float:
+            self.emit("movq xmm0, rax", "text")
+            self.emit("movq xmm1, rbx", "text")
+            if op == '+':
+                self.emit("addsd xmm0, xmm1", "text")
+            elif op == '-':
+                self.emit("subsd xmm0, xmm1", "text")
+            elif op == '*':
+                self.emit("mulsd xmm0, xmm1", "text")
+            elif op == '/':
+                self.emit("divsd xmm0, xmm1", "text")
+            elif op in ('==', '!=', '<', '<=', '>', '>='):
+                self.emit("ucomisd xmm0, xmm1", "text")
+                self.emit({"==": "sete al", "!=": "setne al", "<": "setb al",
+                           "<=": "setbe al", ">": "seta al", ">=": "setae al"}[op], "text")
+                self.emit("movzx eax, al", "text")
+                self.emit("push rax", "text")
+                return
+            elif op == '**':
+                self.emit("; '**' on floats is not yet implemented", "text")
+            self.emit("movq rax, xmm0", "text")
+            self.emit("push rax", "text")
+            return
+
+        if op == '+':
+            self.emit("add rax, rbx", "text")
+        elif op == '-':
+            self.emit("sub rax, rbx", "text")
+        elif op == '*':
+            self.emit("imul rax, rbx", "text")
+        elif op == '/':
+            self.emit("xor rdx, rdx", "text")
+            self.emit("div rbx", "text")
+        elif op == '%':
+            self.emit("xor rdx, rdx", "text")
+            self.emit("div rbx", "text")
+            self.emit("mov rax, rdx", "text")
+        elif op == '&':
+            self.emit("and rax, rbx", "text")
+        elif op == '|':
+            self.emit("or rax, rbx", "text")
+        elif op == '^':
+            self.emit("xor rax, rbx", "text")
+        elif op == '<<':
+            self.emit("mov rcx, rbx", "text")
+            self.emit("shl rax, cl", "text")
+        elif op == '>>':
+            self.emit("mov rcx, rbx", "text")
+            self.emit("shr rax, cl", "text")
+        elif op == '**':
+            self.emit("; integer '**' is not yet implemented", "text")
+        else:
+            self.emit("cmp rax, rbx", "text")
+            cc = {"==": "sete", "!=": "setne", "<": "setl", "<=": "setle",
+                  ">": "setg", ">=": "setge"}.get(op)
+            if cc:
+                self.emit(f"{cc} al", "text")
+                self.emit("movzx eax, al", "text")
+        self.emit("push rax", "text")
+
+    def gen_conversion(self, node: ASTNode) -> None:
+        target = node.meta.get('target_ref') or TypeRef(base=node.target_type)
+        source = self.ref_of(node.children[0]) if node.children else None
+        self.gen_expression(node.children[0] if node.children else None)
+        self.emit("pop rax", "text")
+
+        src_float = self.is_float_ref(source) or self.is_float_node(node.children[0])
+        dst_float = self.is_float_ref(target)
+        tsize = self.size_of(target)
+        method = node.conversion_method
+
+        if src_float and dst_float:
+            pass
+        elif src_float and not dst_float:
+            self.emit("movq xmm0, rax", "text")
+            self.emit("cvttsd2si rax, xmm0", "text")
+        elif not src_float and dst_float:
+            self.emit("cvtsi2sd xmm0, rax", "text")
+            self.emit("movq rax, xmm0", "text")
+
+        if method == 'saturating' and tsize < 8:
+            limit = (1 << (tsize * 8)) - 1
+            self.emit(f"cmp rax, {limit}", "text")
+            ok = self.new_label()
+            self.emit(f"jbe {ok}", "text")
+            self.emit(f"mov rax, {limit}", "text")
+            self.emit_raw(f"{ok}:", "text")
+
+        # truncate to the target width (zero-extending writes need no imm64)
+        if tsize == 1:
+            self.emit("movzx eax, al", "text")
+        elif tsize == 2:
+            self.emit("movzx eax, ax", "text")
+        elif tsize == 4:
+            self.emit("mov eax, eax", "text")
+
+        self.emit("push rax", "text")
 
 class Compiler:
     def __init__(self, backend: Backend = Backend.NASM, opt_level: OptimizationLevel = OptimizationLevel.O2,
@@ -3061,4 +4778,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
