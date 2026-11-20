@@ -118,7 +118,8 @@ computing a `rel16` displacement), pads to 510 bytes and writes the signature.
 | --- | --- |
 | `lowlc.py` | The compiler: lexer, parser, semantic checks, optimiser, x86-64 code generator, CLI |
 | `manual.txt` | Language reference manual (prose only) |
-| `test1.lowl` … `test7.lowl` | Feature test programs (syntax, control flow, functions, OOP, conversions, SIMD, templates) |
+| `test1.lowl` … `test7.lowl`, `test_simd_core.lowl` | Language feature regression programs |
+| `tests/test_codegen.py` | Code-generation regressions for SIMD, templates, classes, FPU, and optimization |
 | `tools/validate_asm.py` | Assembles every emitted instruction with Keystone to catch invalid output |
 | `tools/build_boot_image.py` | Turns `-f boot` output into a 512-byte bootable image (no nasm required) |
 | `boot_demo.lowl` | Boot sector demo: VGA bar, BIOS text, arithmetic, keyboard, halt |
@@ -126,9 +127,12 @@ computing a `rel16` displacement), pads to 510 bytes and writes the signature.
 
 ## Testing
 
-Compile every test program and validate the generated instructions:
+Run the focused regressions, compile each LOWL test program, then validate the
+generated instructions:
 
 ```sh
+python3 -m unittest discover -s tests -v
+mkdir -p out
 for f in test*.lowl; do python3 lowlc.py "$f" -o "out/${f%.lowl}.asm"; done
 python3 tools/validate_asm.py out/*.asm
 ```
@@ -139,32 +143,55 @@ checks instruction encoding only — it is not a linker.
 
 ## Implementation status
 
-The front end implements the documented grammar: all seven test programs parse
-and compile with no diagnostics.
+The front end implements the documented grammar used by the sample programs.
+Parsing a construct does not imply that every operation described in the
+reference manual is implemented.
 
 The code generator covers the core of the language:
 
 * SysV AMD64 calling convention, stack frames, locals sized by type
-* arrays, structs and classes with computed field offsets and layout
+* arrays and structs; classes with computed layouts, inheritance, constructors,
+  and virtual method dispatch
 * indexing, member access, address-of, dereference, pointer arithmetic
-* arithmetic, bitwise and comparison operators, including SSE scalar `f64`
+* arithmetic, bitwise and comparison operators; scalar SSE `f32`/`f64` arithmetic
+  and IEEE-aware comparisons
+* all six documented floating-point vector widths, vector constructors,
+  elementwise `+`, `-`, `*`, `/`, copying, indexing, `iota`, `broadcast`, dot
+  product, reductions, and elementwise `fma`-named multiply-plus-add
 * `if`/`elif`/`else`, all three `for` forms, `while`, `switch` with guards,
   `break`/`continue`
 * function and method calls, overload selection, default parameters, implicit
   `self` receivers, `super.new(...)`
 * `as` conversions between integer widths and between integer and `f64`
 * string and float literals in `.rodata`, static data in `.data`/`.bss`
+* function-template monomorphization for inferred type parameters, explicit
+  function specializations, and one-word `Option<T>` payloads
 
-Not yet implemented, and reported in the generated assembly as comments rather
-than silently miscompiled:
+The `fma` method currently emits separate multiply and add instructions; it is
+not fused and does not require the FMA ISA extension. AVX/AVX-512 output is not
+runtime-dispatched: run it only on a CPU that supports the selected ISA. The
+vector value ABI for function parameters/returns and vector global initializers
+are not implemented. Generic function templates work for type parameters that
+can be inferred from arguments; class-template member signatures are not
+monomorphized, and `Option<T>` currently carries at most one machine word.
 
-* SIMD vector arithmetic and the `vec*` builtin methods (`iota`, `broadcast`,
-  `dot`, `fma`, horizontal reductions)
-* `Option<T>` construction and pattern handling (`Option.some`/`Option.none`)
-* virtual dispatch — `virtual`/`override` methods currently resolve statically
-* `**` on integers, template specialisation selection, `BlockArray` operations
+Not yet implemented or only partially implemented; accepted syntax outside
+the supported paths below must not be assumed to have correct runtime
+semantics:
+
+* full generic class specialization, arbitrary-width `Option<T>` payloads,
+  `BlockArray` operations, and SIMD load/store, mask, shuffle, and comparison
+  intrinsics
+* x87 `f80`, vector parameters/returns, and arbitrary non-integral floating
+  exponentiation (constant integer powers through 32 and `+/-0.5` are supported)
 * returning structs by value (constructors return a pointer to scratch storage)
 * more than six arguments per call
+
+The optimizer is a conservative AST pass, not an LLVM-equivalent optimizer.
+O1 adds constant folding, literal-condition elimination, and integer
+identities; O2 adds power-of-two multiplication strength reduction. O3 currently
+does not add loop unrolling or automatic vectorization. No LLVM-level claim is
+made for generated code quality.
 
 ## License
 

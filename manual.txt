@@ -1597,7 +1597,9 @@ let result3 = c * 2;       // u16 multiplication (65535 * 2 = 131070, wraps to 6
 
 5.3 Floating-Point Types
 
-lowl supports IEEE 754 single-precision (f32) and double-precision (f64) floating-point types. These types follow standard floating-point semantics: division by zero produces infinity, invalid operations produce NaN (Not a Number), and rounding mode is configurable via the FPU control register. Floating-point operations are performed using x87 FPU or SSE/AVX instructions depending on the context and optimization level.
+lowl supports IEEE 754 single-precision (f32) and double-precision (f64) floating-point types. These types follow IEEE 754 arithmetic for supported scalar operations: division by zero produces infinity and invalid operations produce NaN (Not a Number). The MXCSR control/status builtins expose SSE floating-point controls.
+
+Implementation note (compiler v2.1.0): scalar arithmetic uses SSE2 double-precision instructions. Values stored as f32 are widened for expression evaluation and narrowed when stored, so intermediate f32 rounding is not guaranteed to match a native single-precision operation. `f80` is not implemented. Floating `%` and arbitrary non-integral powers are also unsupported; power accepts constant integer exponents through 32 and `+/-0.5`.
 
 lowl
 
@@ -4037,6 +4039,11 @@ Calculator memory: 42.000
 
 Chapter 9: Object-Oriented Programming
 
+Implementation note (compiler v2.1.0): class layouts, constructors, single
+inheritance, `super` calls, and virtual dispatch are implemented. The parser
+records visibility sections, but access control is not enforced; abstract
+classes are not checked for unimplemented methods.
+
 9.1 Classes and Instances
 
 lowl supports object-oriented programming with classes, inheritance, polymorphism, and encapsulation. A class defines the structure (fields) and behavior (methods) of objects. Objects are instances of classes, created with the new keyword.
@@ -4953,6 +4960,15 @@ Status messages at the bottom of the screen
 
 
 Chapter 10: Templates and Generics
+
+Implementation note (compiler v2.1.0): function templates with inferable type
+parameters are monomorphized, and exact non-template overloads (including
+`template<>` function specializations) take precedence. Class-template syntax
+is parsed, but class members are not separately instantiated with substituted
+types. The current `Option<T>` representation supports a tag plus one
+machine-word payload; larger payloads are unsupported. Examples requiring
+full class-template substitution should be treated as design examples, not as
+working compiler tests.
 
 10.1 Template Declaration Syntax
 
@@ -10179,6 +10195,8 @@ Chapter 16: SIMD Vector Operations
 
 Single Instruction, Multiple Data (SIMD) is a parallel computing technique where a single instruction operates on multiple data elements simultaneously. Modern x86_64 processors support several SIMD instruction set extensions: SSE (Streaming SIMD Extensions) with 128-bit registers, AVX (Advanced Vector Extensions) with 256-bit registers, and AVX-512 with 512-bit registers. lowl provides first-class SIMD vector types that map directly to these hardware registers. Unlike languages that require compiler intrinsics or auto-vectorization heuristics, lowl's SIMD types are built into the language, allowing you to write explicit vector code that compiles to optimal assembly. The compiler automatically handles register allocation, instruction selection, and alignment requirements, while you focus on the parallel algorithm. This chapter covers all SIMD vector types, operations, memory access patterns, and optimization techniques for high-performance computing.
 
+Implementation note (compiler v2.1.0): the current backend supports the six f32/f64 vector types, explicit lane constructors, elementwise `+`, `-`, `*`, `/`, local copies, lane indexing, `iota`, `broadcast`, `dot`, `hadd_all`, `hmax`, `hmin`, and `fma`. The `fma` method currently emits separate multiply and add instructions; it is not fused. SIMD values are stack-backed, not kept in a register allocator, and vector function arguments/returns, global initializers, comparisons, masks, shuffles, and general load/store methods are not implemented. AVX and AVX-512 instructions require a compatible CPU; the compiler does not dispatch at runtime. The remaining examples in this chapter describe the language design and are not all executable by the current compiler.
+
 16.2 SIMD Vector Types Overview
 
 lowl provides vector types for each SIMD level and data type combination. For single-precision floats (f32), the types are vec4_f32 (SSE, 4 elements), vec8_f32 (AVX, 8 elements), and vec16_f32 (AVX-512, 16 elements). For double-precision floats (f64), the types are vec2_f64 (SSE2, 2 elements), vec4_f64 (AVX, 4 elements), and vec8_f64 (AVX-512, 8 elements). For integers, lowl provides vector types for 8, 16, 32, and 64-bit integers at each SIMD level, though this chapter focuses on floating-point vectors as they are most common in high-performance computing. Mask types (mask8, mask16, mask64) are used with AVX-512 for predicated operations, allowing selective processing of individual vector lanes.
@@ -12115,6 +12133,15 @@ Chapter 19: Optimizer and Pragmas
 19.1 Introduction to Optimization in lowl
 
 Optimization is the process of transforming source code into equivalent but more efficient machine code. lowl provides four optimization levels (O0 through O3) that balance compilation time, code size, and execution speed. Unlike many compilers that apply optimizations indiscriminately, lowl's optimizer is designed with systems programming in mind: optimizations must never change the observable behavior of programs that interact with hardware. This means that volatile accesses (via mmio_ptr), memory-mapped I/O operations, and inline assembly are preserved exactly as written. The optimizer operates on the abstract syntax tree (AST), performing transformations that are sound for all lowl programs. This chapter covers each optimization level in detail, the specific transformations applied, and the pragmas that give programmers fine-grained control over optimization.
+
+Implementation note (compiler v2.1.0): this is a small AST optimizer, not an
+LLVM-equivalent optimizer. O0 skips AST optimization. O1 performs literal
+constant folding, literal-condition elimination, and integer identities. O2
+adds power-of-two multiplication strength reduction. O3 currently adds no
+loop unrolling or automatic vectorization. There is no SSA/CFG optimizer,
+register allocator, or target-specific cost model, and no LLVM-level code
+quality claim is made. The optimization examples below that name unsupported
+passes are design goals, not current compiler behavior.
 
 19.2 Optimization Level O0: No Optimization
 

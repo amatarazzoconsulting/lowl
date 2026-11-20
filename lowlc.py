@@ -22,6 +22,7 @@ import sys
 import re
 import struct
 import argparse
+import copy
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any, Tuple, Set
 from enum import Enum
@@ -135,6 +136,9 @@ DATA_TYPE_TABLE = [
     DataTypeInfo(DataType.VEC4_F32, 16, 16, "vec4_f32", "dq", "xmm0", "dq", 16, "SSE"),
     DataTypeInfo(DataType.VEC8_F32, 32, 32, "vec8_f32", "dq", "ymm0", "dq", 32, "AVX"),
     DataTypeInfo(DataType.VEC16_F32, 64, 64, "vec16_f32", "dq", "zmm0", "dq", 64, "AVX512"),
+    DataTypeInfo(DataType.VEC2_F64, 16, 16, "vec2_f64", "dq", "xmm0", "dq", 16, "SSE"),
+    DataTypeInfo(DataType.VEC4_F64, 32, 32, "vec4_f64", "dq", "ymm0", "dq", 32, "AVX"),
+    DataTypeInfo(DataType.VEC8_F64, 64, 64, "vec8_f64", "dq", "zmm0", "dq", 64, "AVX512"),
 ]
 
 # ============================================================================
@@ -166,6 +170,7 @@ class TokenType(Enum):
     KW_F32 = 108; KW_F64 = 109; KW_BOOL = 110; KW_CHAR = 111
     KW_PTR = 112; KW_MMIO_PTR = 113; KW_BIT = 114
     KW_VEC4_F32 = 115; KW_VEC8_F32 = 116; KW_VEC16_F32 = 117
+    KW_VEC2_F64 = 118; KW_VEC4_F64 = 119; KW_VEC8_F64 = 120
     OP_ASSIGN = 200; OP_PLUS = 201; OP_MINUS = 202; OP_MULTIPLY = 203
     OP_DIVIDE = 204; OP_MOD = 205; OP_EQ = 206; OP_NE = 207; OP_LT = 208
     OP_LE = 209; OP_GT = 210; OP_GE = 211; OP_AND = 212; OP_OR = 213
@@ -319,6 +324,26 @@ class SymbolTable:
         if not hasattr(self, 'classes'):
             self.classes = {}
         self.classes[name] = info
+
+    def specialize_class_ref(self, owner_ref, ref):
+        if not isinstance(owner_ref, TypeRef) or not isinstance(ref, TypeRef):
+            return ref
+        info = self.class_info(owner_ref.name)
+        params = info.get('template_params', []) if info else []
+        bindings = dict(zip(params, owner_ref.params))
+
+        def substitute(value):
+            if value.base == DataType.STRUCT and value.name in bindings:
+                return copy.deepcopy(bindings[value.name])
+            result = copy.deepcopy(value)
+            result.elem = substitute(result.elem) if result.elem else None
+            result.params = [substitute(item) for item in result.params]
+            result.fn_params = [substitute(item) for item in result.fn_params]
+            if result.fn_return is not None:
+                result.fn_return = substitute(result.fn_return)
+            return result
+
+        return substitute(ref) if bindings else ref
 
     def find_method(self, owner: str, name: str):
         """Look a method up along the inheritance chain, most-derived class first."""
@@ -842,6 +867,8 @@ class Lexer:
             'f32': TokenType.KW_F32, 'f64': TokenType.KW_F64, 'bool': TokenType.KW_BOOL, 'char': TokenType.KW_CHAR,
             'ptr': TokenType.KW_PTR, 'mmio_ptr': TokenType.KW_MMIO_PTR, 'bit': TokenType.KW_BIT,
             'vec4_f32': TokenType.KW_VEC4_F32, 'vec8_f32': TokenType.KW_VEC8_F32, 'vec16_f32': TokenType.KW_VEC16_F32,
+            'vec2_f64': TokenType.KW_VEC2_F64, 'vec4_f64': TokenType.KW_VEC4_F64,
+            'vec8_f64': TokenType.KW_VEC8_F64,
             'mut': TokenType.KW_MUT, 'static': TokenType.KW_STATIC, 'impl': TokenType.KW_IMPL,
             'abstract': TokenType.KW_ABSTRACT, 'self': TokenType.KW_SELF,
             'break': TokenType.KW_BREAK, 'continue': TokenType.KW_CONTINUE,
@@ -1099,7 +1126,8 @@ TYPE_START_TOKENS = {TokenType.KW_U8, TokenType.KW_U16, TokenType.KW_U32, TokenT
                      TokenType.KW_F32, TokenType.KW_F64, TokenType.KW_BOOL, TokenType.KW_CHAR,
                      TokenType.KW_PTR, TokenType.KW_MMIO_PTR, TokenType.KW_BIT,
                      TokenType.KW_STRING, TokenType.KW_ARRAY, TokenType.KW_VEC4_F32,
-                     TokenType.KW_VEC8_F32, TokenType.KW_VEC16_F32, TokenType.KW_BLOCK_ARRAY,
+                     TokenType.KW_VEC8_F32, TokenType.KW_VEC16_F32, TokenType.KW_VEC2_F64,
+                     TokenType.KW_VEC4_F64, TokenType.KW_VEC8_F64, TokenType.KW_BLOCK_ARRAY,
                      TokenType.KW_OPTION}
 
 INTEGER_TYPES = {DataType.U8, DataType.U16, DataType.U32, DataType.U64, DataType.U128,
@@ -1107,6 +1135,14 @@ INTEGER_TYPES = {DataType.U8, DataType.U16, DataType.U32, DataType.U64, DataType
                  DataType.BOOL, DataType.CHAR, DataType.BIT}
 FLOAT_TYPES = {DataType.F32, DataType.F64, DataType.F80}
 POINTER_TYPES = {DataType.PTR, DataType.PTR_MUT, DataType.MMIO_PTR, DataType.STRING, DataType.FN}
+VECTOR_INFO = {
+    DataType.VEC4_F32: (4, 4, SIMDLevel.SSE),
+    DataType.VEC8_F32: (8, 4, SIMDLevel.AVX),
+    DataType.VEC16_F32: (16, 4, SIMDLevel.AVX512),
+    DataType.VEC2_F64: (2, 8, SIMDLevel.SSE),
+    DataType.VEC4_F64: (4, 8, SIMDLevel.AVX),
+    DataType.VEC8_F64: (8, 8, SIMDLevel.AVX512),
+}
 
 
 def type_size(ref, symbols=None) -> int:
@@ -1136,12 +1172,8 @@ def type_size(ref, symbols=None) -> int:
         for p in ref.params:
             total += max(8, type_size(p, symbols))
         return total
-    if base in (DataType.VEC4_F32, DataType.VEC2_F64):
-        return 16
-    if base in (DataType.VEC8_F32, DataType.VEC4_F64):
-        return 32
-    if base in (DataType.VEC16_F32, DataType.VEC8_F64):
-        return 64
+    if base in VECTOR_INFO:
+        return VECTOR_INFO[base][0] * VECTOR_INFO[base][1]
     return 8
 
 
@@ -1697,17 +1729,24 @@ class Parser:
         if node.type == ASTType.MEMBER_ACCESS and node.children:
             base = self._static_ref(node.children[0])
             name = self.symbols.struct_name_of(base)
-            return self.symbols.field_ref(name, node.value) if name else None
+            found = self.symbols.field_ref(name, node.value) if name else None
+            return self.symbols.specialize_class_ref(base, found) if found else None
         if node.type == ASTType.INDEX and node.children:
             base = self._static_ref(node.children[0])
             return base.elem if isinstance(base, TypeRef) else None
         if node.type == ASTType.METHOD_CALL and node.children:
             recv = node.children[0]
+            recv_ref = self._static_ref(recv)
+            if isinstance(recv_ref, TypeRef) and recv_ref.base in VECTOR_INFO:
+                if node.value in ('iota', 'broadcast', 'fma'):
+                    return recv_ref
+                if node.value in ('dot', 'hadd_all', 'hmax', 'hmin'):
+                    return TypeRef(base=DataType.F64)
             owner = recv.value if recv.meta.get('is_type_name') else \
-                self.symbols.struct_name_of(self._static_ref(recv))
+                self.symbols.struct_name_of(recv_ref)
             fn = self.symbols.find_method(owner, node.value) if owner else None
             if fn is not None and isinstance(fn.meta.get('return_ref'), TypeRef):
-                return fn.meta['return_ref']
+                return self.symbols.specialize_class_ref(recv_ref, fn.meta['return_ref'])
         return None
 
     def _infer_ref(self, value: Optional[ASTNode]) -> TypeRef:
@@ -1727,23 +1766,41 @@ class Parser:
             elem = self._infer_ref(value.children[0]) if value.children else TypeRef(base=DataType.U64)
             return TypeRef(base=DataType.ARRAY, elem=elem,
                            length=len(value.children) or value.meta.get('repeat', 0))
+        if value.type == ASTType.SIMD_OPERATION and value.value in PRIMITIVE_TYPES:
+            return TypeRef(base=PRIMITIVE_TYPES[value.value], name=value.value)
         if value.type == ASTType.STRUCT_LITERAL:
             return TypeRef(base=DataType.STRUCT, name=value.value)
         if value.type == ASTType.LAMBDA:
             return TypeRef(base=DataType.FN)
         if value.type == ASTType.METHOD_CALL and value.children:
             recv = value.children[0]
+            if recv.meta.get('is_type_name') and recv.value == 'Option':
+                if value.value == 'some' and len(value.children) > 1:
+                    return TypeRef(base=DataType.OPTION, name='Option',
+                                   elem=self._infer_ref(value.children[1]))
+                if value.value == 'none':
+                    return TypeRef(base=DataType.OPTION, name='Option',
+                                   elem=TypeRef(base=DataType.U64))
+            recv_ref = self._static_ref(recv)
+            if isinstance(recv_ref, TypeRef) and recv_ref.base in VECTOR_INFO:
+                if value.value in ('iota', 'broadcast', 'fma'):
+                    return recv_ref
+                if value.value in ('dot', 'hadd_all', 'hmax', 'hmin'):
+                    return TypeRef(base=DataType.F64)
             owner = None
             if recv.meta.get('is_type_name'):
                 owner = recv.value
                 if value.value == 'new' and owner:
-                    return TypeRef(base=DataType.STRUCT, name=owner)
+                    recv_ref = self._static_ref(recv)
+                    return TypeRef(base=DataType.STRUCT, name=owner,
+                                   params=recv_ref.params if isinstance(recv_ref, TypeRef) else [])
             else:
                 owner = self.symbols.struct_name_of(self._static_ref(recv)) or None
             if owner:
                 fn = self.symbols.find_method(owner, value.value)
                 if fn is not None and isinstance(fn.meta.get('return_ref'), TypeRef):
-                    return fn.meta['return_ref']
+                    return self.symbols.specialize_class_ref(self._static_ref(recv),
+                                                             fn.meta['return_ref'])
         if value.type in (ASTType.CALL, ASTType.METHOD_CALL):
             ret = value.meta.get('return_ref')
             if isinstance(ret, TypeRef):
@@ -2074,6 +2131,7 @@ class Parser:
         self.symbols.register_class(name_tok.value, {
             'base': base, 'virtuals': virtuals, 'has_vptr': has_vptr,
             'abstract': 'abstract' in (node.meta.get('modifiers') or []),
+            'template_params': list(node.template_params),
         })
         self.symbols.define_struct(name_tok.value, fields, base=base, has_vptr=has_vptr)
         return node
@@ -2140,6 +2198,8 @@ class Parser:
             self.match(TokenType.OP_COMMA)
         self.expect_generic_close("Expected '>'")
 
+        while self.current().type == TokenType.NEWLINE:
+            self.advance()
         inner = None
         if self.current().type == TokenType.KW_CLASS:
             inner = self.parse_class()
@@ -2151,6 +2211,8 @@ class Parser:
             inner = self.parse_impl()
         if inner is not None:
             inner.template_params = node.template_params
+            if not node.template_params:
+                inner.meta['template_specialization'] = True
             node.add_child(inner)
             node.value = inner.value
         return node
@@ -2556,6 +2618,13 @@ class Parser:
             right = self.parse_binary_op(next_min)
             if not right:
                 return left
+            left_ref, right_ref = self._static_ref(left), self._static_ref(right)
+            left_base = left_ref.base if isinstance(left_ref, TypeRef) else left.data_type
+            right_base = right_ref.base if isinstance(right_ref, TypeRef) else right.data_type
+            if left_base in VECTOR_INFO or right_base in VECTOR_INFO:
+                if left_base != right_base or tok.value not in ('+', '-', '*', '/'):
+                    self.errors.add_error("SIMD binary operations require matching vector types and arithmetic operators",
+                                          tok.line, tok.column)
             binary = ASTNode(ASTType.BINARY_OP, tok.value, tok.line, tok.column)
             binary.add_child(left)
             binary.add_child(right)
@@ -2566,6 +2635,12 @@ class Parser:
     def _binary_result_type(self, node: ASTNode) -> DataType:
         left = node.children[0] if node.children else None
         right = node.children[1] if len(node.children) > 1 else None
+        left_ref = left.meta.get('type_ref') if left is not None else None
+        right_ref = right.meta.get('type_ref') if right is not None else None
+        left_base = left_ref.base if isinstance(left_ref, TypeRef) else left.data_type if left else DataType.VOID
+        right_base = right_ref.base if isinstance(right_ref, TypeRef) else right.data_type if right else DataType.VOID
+        if left_base == right_base and left_base in VECTOR_INFO:
+            return left_base
         for side in (left, right):
             if side is None:
                 continue
@@ -2649,6 +2724,9 @@ class Parser:
                 base_ref = node.meta.get('type_ref')
                 if isinstance(base_ref, TypeRef) and base_ref.elem is not None:
                     elem = base_ref.elem
+                elif isinstance(base_ref, TypeRef) and base_ref.base in VECTOR_INFO:
+                    lane_size = VECTOR_INFO[base_ref.base][1]
+                    elem = TypeRef(base=DataType.F32 if lane_size == 4 else DataType.F64)
                 index_node.meta['type_ref'] = elem or TypeRef(base=DataType.U64)
                 node = index_node
                 continue
@@ -2668,6 +2746,11 @@ class Parser:
                 else:
                     member = ASTNode(ASTType.MEMBER_ACCESS, name_tok.value, tok.line, tok.column)
                     member.add_child(node)
+                    base_ref = self._static_ref(node)
+                    owner = self.symbols.struct_name_of(base_ref)
+                    found = self.symbols.field_ref(owner, name_tok.value) if owner else None
+                    if found is not None:
+                        member.meta['type_ref'] = self.symbols.specialize_class_ref(base_ref, found)
                     node = member
                 continue
             if tok.type == TokenType.OP_LPAREN:
@@ -2751,12 +2834,12 @@ class Parser:
             node.data_type = DataType.U64
             return node
 
-        if tok.type in (TokenType.KW_VEC4_F32, TokenType.KW_VEC8_F32, TokenType.KW_VEC16_F32):
+        if tok.type in (TokenType.KW_VEC4_F32, TokenType.KW_VEC8_F32,
+                        TokenType.KW_VEC16_F32, TokenType.KW_VEC2_F64,
+                        TokenType.KW_VEC4_F64, TokenType.KW_VEC8_F64):
             self.advance()
             node = ASTNode(ASTType.SIMD_OPERATION, tok.value, tok.line, tok.column)
-            node.simd_level = {TokenType.KW_VEC4_F32: SIMDLevel.SSE,
-                               TokenType.KW_VEC8_F32: SIMDLevel.AVX,
-                               TokenType.KW_VEC16_F32: SIMDLevel.AVX512}[tok.type]
+            node.simd_level = VECTOR_INFO[PRIMITIVE_TYPES[tok.value]][2]
             return self.parse_simd_constructor(node)
 
         if tok.type == TokenType.KW_NEW:
@@ -2806,18 +2889,27 @@ class Parser:
                 return self.parse_struct_literal(tok)
 
             # generic instantiation: Stack<u64>.new(), Pair<K, V>{...}
+            generic_args = []
             if self.at_generic_open() and tok.value in self.known_types:
                 self.advance()
                 while not self.at_generic_close() and self.current().type != TokenType.TOK_EOF:
-                    self.advance()
+                    generic_args.append(self.parse_type_ref())
+                    if not self.match(TokenType.OP_COMMA):
+                        break
                 self.expect_generic_close("Expected '>'")
 
             var_node = ASTNode(ASTType.VARIABLE, tok.value, tok.line, tok.column)
+            if tok.type == TokenType.KW_OPTION:
+                var_node.meta['type_ref'] = TypeRef(base=DataType.OPTION, name='Option')
+                var_node.meta['is_type_name'] = True
             sym = self.symbols.lookup(tok.value)
             if sym is not None and sym.type_ref is not None:
                 var_node.meta['type_ref'] = sym.type_ref
             elif tok.value in self.known_types:
-                var_node.meta['type_ref'] = self.known_types[tok.value]
+                known = self.known_types[tok.value]
+                var_node.meta['type_ref'] = TypeRef(base=known.base, name=known.name,
+                                                    elem=known.elem, length=known.length,
+                                                    params=generic_args)
                 var_node.meta['is_type_name'] = True
             if tok.value not in self.known_types:
                 self._stamp_var(var_node, tok.value)
@@ -2945,8 +3037,18 @@ class Parser:
         return node
 
     def parse_simd_constructor(self, node: ASTNode) -> ASTNode:
-        if self.match(TokenType.OP_LPAREN):
+        has_arguments = self.match(TokenType.OP_LPAREN)
+        if has_arguments:
             self._parse_arguments(node)
+        vector_type = PRIMITIVE_TYPES[node.value]
+        lanes = VECTOR_INFO[vector_type][0]
+        node.meta['type_ref'] = TypeRef(base=vector_type, name=node.value)
+        if has_arguments and len(node.children) != lanes:
+            self.errors.add_error(
+                f"{node.value} constructor requires {lanes} lane values, got {len(node.children)}",
+                node.line, node.column)
+        elif not has_arguments and self.current().type != TokenType.OP_DOT:
+            self.errors.add_error(f"{node.value} requires a lane constructor", node.line, node.column)
         return node
 
     def parse_constructor(self) -> Optional[ASTNode]:
@@ -3062,55 +3164,144 @@ class Optimizer:
         return value is None or str(node.value) == value
 
     def constant_folding(self, node: ASTNode) -> ASTNode:
-        if node.type == ASTType.BINARY_OP and len(node.children) == 2:
-            left = node.children[0]
-            right = node.children[1]
-            if self._is_int_literal(left) and self._is_int_literal(right):
-                try:
-                    lval = int(left.value)
-                    rval = int(right.value)
-                    if node.value == "+":
-                        return ASTNode(ASTType.LITERAL, str(lval + rval), node.line, node.column)
-                    elif node.value == "-":
-                        return ASTNode(ASTType.LITERAL, str(lval - rval), node.line, node.column)
-                    elif node.value == "*":
-                        return ASTNode(ASTType.LITERAL, str(lval * rval), node.line, node.column)
-                    elif node.value == "/" and rval != 0:
-                        return ASTNode(ASTType.LITERAL, str(lval // rval), node.line, node.column)
-                except ValueError:
-                    pass
         for i, child in enumerate(node.children):
             node.children[i] = self.constant_folding(child)
+        if node.type == ASTType.UNARY_OP and node.children:
+            operand = node.children[0]
+            if self._is_int_literal(operand):
+                value = int(operand.value)
+                result = {'-': lambda: -value, '+': lambda: value,
+                          '~': lambda: ~value, 'not': lambda: int(not value),
+                          '!': lambda: int(not value)}.get(node.value)
+                if result:
+                    folded = ASTNode(ASTType.LITERAL, str(result()), node.line, node.column)
+                    folded.data_type = DataType.BOOL if node.value in ('not', '!') else operand.data_type
+                    return folded
+            if node.value == '-' and operand.type == ASTType.LITERAL \
+                    and operand.data_type in FLOAT_TYPES and not operand.meta.get('is_string'):
+                folded = ASTNode(ASTType.LITERAL, repr(-float(operand.value)), node.line, node.column)
+                folded.data_type = operand.data_type
+                return folded
+        if node.type != ASTType.BINARY_OP or len(node.children) != 2:
+            return node
+        left, right = node.children
+        if self._is_int_literal(left) and self._is_int_literal(right):
+            lval, rval = int(left.value), int(right.value)
+            quotient = (abs(lval) // abs(rval)) * (-1 if (lval < 0) != (rval < 0) else 1) \
+                if rval else None
+            operations = {
+                "+": lambda: lval + rval,
+                "-": lambda: lval - rval,
+                "*": lambda: lval * rval,
+                "/": lambda: quotient,
+                "%": lambda: lval - quotient * rval,
+                "<<": lambda: lval << rval if 0 <= rval < 64 else None,
+                ">>": lambda: lval >> rval if 0 <= rval < 64 else None,
+                "&": lambda: lval & rval,
+                "|": lambda: lval | rval,
+                "^": lambda: lval ^ rval,
+                "==": lambda: int(lval == rval),
+                "!=": lambda: int(lval != rval),
+                "<": lambda: int(lval < rval),
+                "<=": lambda: int(lval <= rval),
+                ">": lambda: int(lval > rval),
+                ">=": lambda: int(lval >= rval),
+                "and": lambda: int(bool(lval) and bool(rval)),
+                "or": lambda: int(bool(lval) or bool(rval)),
+            }
+            try:
+                result = operations[node.value]() if node.value in operations else None
+            except (ArithmeticError, TypeError, ValueError):
+                result = None
+            if isinstance(result, int) and -(1 << 63) <= result <= (1 << 64) - 1:
+                folded = ASTNode(ASTType.LITERAL, str(result), node.line, node.column)
+                folded.data_type = DataType.BOOL if node.value in (
+                    "==", "!=", "<", "<=", ">", ">=", "and", "or") else node.data_type
+                return folded
+
+        def float_literal(value):
+            if value.type != ASTType.LITERAL or value.meta.get('is_string') \
+                    or value.data_type == DataType.CHAR:
+                return None
+            try:
+                return float(value.value) if value.data_type in FLOAT_TYPES \
+                    or any(c in str(value.value).lower() for c in ".e") else None
+            except (TypeError, ValueError):
+                return None
+
+        lfloat, rfloat = float_literal(left), float_literal(right)
+        if lfloat is not None and rfloat is not None:
+            operations = {
+                "+": lambda: lfloat + rfloat,
+                "-": lambda: lfloat - rfloat,
+                "*": lambda: lfloat * rfloat,
+                "/": lambda: lfloat / rfloat,
+                "==": lambda: int(lfloat == rfloat),
+                "!=": lambda: int(lfloat != rfloat),
+                "<": lambda: int(lfloat < rfloat),
+                "<=": lambda: int(lfloat <= rfloat),
+                ">": lambda: int(lfloat > rfloat),
+                ">=": lambda: int(lfloat >= rfloat),
+            }
+            try:
+                result = operations[node.value]() if node.value in operations else None
+            except (ArithmeticError, ValueError):
+                result = None
+            if isinstance(result, (float, int)):
+                folded = ASTNode(ASTType.LITERAL, repr(result) if isinstance(result, float)
+                                 else str(result), node.line, node.column)
+                folded.data_type = DataType.BOOL if node.value in (
+                    "==", "!=", "<", "<=", ">", ">=") else DataType.F64
+                return folded
         return node
         
     def dead_code_elimination(self, node: ASTNode) -> ASTNode:
         if node.type == ASTType.IF_STMT and len(node.children) > 0:
             cond = node.children[0]
             if self._is_int_literal(cond):
-                if cond.value == "0":
+                if int(cond.value) == 0:
                     if len(node.children) > 2:
                         return node.children[2]
                     else:
                         return ASTNode(ASTType.BLOCK, line=node.line, column=node.column)
-                elif cond.value != "0":
+                else:
                     if len(node.children) > 1:
                         return node.children[1]
+        if node.type in (ASTType.BLOCK, ASTType.FUNCTION):
+            reachable = []
+            for child in node.children:
+                reachable.append(self.dead_code_elimination(child))
+                if child.type == ASTType.RETURN_STMT:
+                    break
+            node.children = reachable
+            return node
         for i, child in enumerate(node.children):
             node.children[i] = self.dead_code_elimination(child)
         return node
         
     def peephole_optimizations(self, node: ASTNode) -> ASTNode:
-        # Only identities that are valid for every operand type are applied here.
-        # (`x * 2 -> x << 1` was removed: it corrupts float operands.)
-        if node.type == ASTType.BINARY_OP and node.value == "+" and len(node.children) == 2:
-            left, right = node.children
-            if self._is_int_literal(right, "0"):
-                return self.peephole_optimizations(left)
-            if self._is_int_literal(left, "0"):
-                return self.peephole_optimizations(right)
         for i, child in enumerate(node.children):
             node.children[i] = self.peephole_optimizations(child)
+        if node.type == ASTType.BINARY_OP and len(node.children) == 2 \
+                and all(self._is_integer_expr(c) for c in node.children):
+            left, right = node.children
+            if node.value in ("+", "-", "|", "^") and self._is_int_literal(right, "0"):
+                return left
+            if node.value in ("+", "|", "^") and self._is_int_literal(left, "0"):
+                return right
+            if node.value == "*" and self._is_int_literal(right, "1"):
+                return left
+            if node.value == "*" and self._is_int_literal(left, "1"):
+                return right
+            if node.value == "/" and self._is_int_literal(right, "1"):
+                return left
         return node
+
+    @staticmethod
+    def _is_integer_expr(node: ASTNode) -> bool:
+        ref = node.meta.get('type_ref')
+        return Optimizer._is_int_literal(node) or node.data_type in INTEGER_TYPES \
+            or isinstance(ref, TypeRef) and ref.base in INTEGER_TYPES
 
     def loop_invariant_motion(self, node: ASTNode) -> ASTNode:
         # Disabled: the previous implementation moved expression children of a
@@ -3410,7 +3601,12 @@ class CodeGenerator:
             # a call used as a statement: evaluate it and discard the pushed result
             # (METHOD_CALL statements used to be silently dropped, CALL leaked a slot)
             self.gen_call(node)
-            self.emit("add rsp, 8", "text")
+            result_ref = self.ref_of(node)
+            result_size = self.size_of(result_ref) if isinstance(result_ref, TypeRef) \
+                and result_ref.base in VECTOR_INFO else \
+                self.option_size(result_ref) if isinstance(result_ref, TypeRef) \
+                and result_ref.base == DataType.OPTION else 8
+            self.emit(f"add rsp, {result_size}", "text")
         elif node.type == ASTType.BUILTIN_CALL:
             self.gen_builtin(node)
         elif node.type == ASTType.BLOCK:
@@ -3425,7 +3621,29 @@ class CodeGenerator:
         elif node.type == ASTType.BLOCK_ARRAY_METHOD:
             self.gen_block_array_method(node)
         elif node.type == ASTType.SIMD_OPERATION:
-            self.gen_simd_operation(node)
+            self.gen_expression(node)
+            ref = self.ref_of(node)
+            if isinstance(ref, TypeRef) and ref.base == DataType.OPTION:
+                size = self.option_size(ref)
+                if value is None:
+                    self.gen_address(lhs)
+                    self.emit("mov rbx, rax", "text")
+                    for offset in range(0, size, 8):
+                        self.emit(f"mov qword [rbx + {offset}], 0", "text")
+                else:
+                    self.gen_expression(value)
+                    self.emit("push rsp", "text")
+                    self.gen_address(lhs)
+                    self.emit("mov rbx, rax", "text")
+                    self.emit("pop r10", "text")
+                    for offset in range(0, size, 8):
+                        self.emit(f"mov rax, qword [r10 + {offset}]", "text")
+                        self.emit(f"mov qword [rbx + {offset}], rax", "text")
+                    self.emit(f"add rsp, {size}", "text")
+                return
+
+            if isinstance(ref, TypeRef) and ref.base in VECTOR_INFO:
+                self.emit(f"add rsp, {self.size_of(ref)}", "text")
         elif node.type == ASTType.IMPORT_STMT:
             self.gen_import(node)
         elif node.type == ASTType.EXPORT_STMT:
@@ -3440,8 +3658,13 @@ class CodeGenerator:
         elif node.type == ASTType.CONTINUE_STMT:
             if self.continue_labels:
                 self.emit(f"jmp {self.continue_labels[-1]}", "text")
+        elif node.type == ASTType.TEMPLATE_DECL:
+            for child in node.children:
+                if child.type == ASTType.FUNCTION and child.template_params:
+                    continue
+                self.gen_statement(child)
         elif node.type in (ASTType.STRUCT_DEF, ASTType.CLASS, ASTType.IMPL_BLOCK,
-                           ASTType.TEMPLATE_DECL, ASTType.ENUM_DEF, ASTType.MODULE):
+                           ASTType.ENUM_DEF, ASTType.MODULE):
             for child in node.children:
                 self.gen_statement(child)
         elif node.type in (ASTType.UNARY_OP, ASTType.INDEX, ASTType.MEMBER_ACCESS,
@@ -3561,56 +3784,214 @@ class CodeGenerator:
             self.emit("vshufps zmm0, zmm0, zmm1, 0b11011000", "text")
             
     def gen_simd_operation(self, node: ASTNode) -> None:
-        op = node.value
-        level = node.simd_level
-        
-        if len(node.children) > 0:
-            self.gen_expression(node.children[0])
-            if len(node.children) > 1:
-                self.emit("pop rbx", "text")
-            self.emit("pop rax", "text")
-            
-            # SIMD register mapping
-            if level == SIMDLevel.SSE:
-                self.emit("movaps xmm0, [rax]", "text")
-                if len(node.children) > 1:
-                    self.emit("movaps xmm1, [rbx]", "text")
-            elif level == SIMDLevel.AVX:
-                self.emit("vmovaps ymm0, [rax]", "text")
-                if len(node.children) > 1:
-                    self.emit("vmovaps ymm1, [rbx]", "text")
+        ref = self.ref_of(node)
+        if not isinstance(ref, TypeRef) or ref.base not in VECTOR_INFO:
+            self.emit(f"; unsupported SIMD operation {node.value}", "text")
+            return
+        lanes, lane_size, _ = VECTOR_INFO[ref.base]
+        size = lanes * lane_size
+        self.emit(f"sub rsp, {size}", "text")
+        for i, arg in enumerate(node.children):
+            self.gen_scalar_double(arg)
+            offset = i * lane_size
+            if lane_size == 4:
+                self.emit("cvtsd2ss xmm1, xmm0", "text")
+                self.emit("movd eax, xmm1", "text")
+                self.emit(f"mov dword [rsp + {offset}], eax", "text")
             else:
-                self.emit("vmovaps zmm0, [rax]", "text")
-                if len(node.children) > 1:
-                    self.emit("vmovaps zmm1, [rbx]", "text")
-                    
-            # SIMD operations
-            if op == "add":
-                self.emit(f"{'v' if level != SIMDLevel.SSE else ''}addps xmm0, xmm1" if level == SIMDLevel.SSE 
-                         else f"vaddps {'ymm' if level == SIMDLevel.AVX else 'zmm'}0, {'ymm' if level == SIMDLevel.AVX else 'zmm'}0, {'ymm' if level == SIMDLevel.AVX else 'zmm'}1", "text")
-            elif op == "mul":
-                self.emit(f"{'v' if level != SIMDLevel.SSE else ''}mulps xmm0, xmm1" if level == SIMDLevel.SSE
-                         else f"vmulps {'ymm' if level == SIMDLevel.AVX else 'zmm'}0, {'ymm' if level == SIMDLevel.AVX else 'zmm'}0, {'ymm' if level == SIMDLevel.AVX else 'zmm'}1", "text")
-            elif op == "hadd":
-                if level == SIMDLevel.SSE:
-                    self.emit("haddps xmm0, xmm0", "text")
+                self.emit("movq rax, xmm0", "text")
+                self.emit(f"mov qword [rsp + {offset}], rax", "text")
+
+    def gen_vector_binary(self, node: ASTNode, ref: TypeRef) -> None:
+        lanes, lane_size, level = VECTOR_INFO[ref.base]
+        size = lanes * lane_size
+        suffix = "ps" if lane_size == 4 else "pd"
+        reg = {SIMDLevel.SSE: "xmm", SIMDLevel.AVX: "ymm",
+               SIMDLevel.AVX512: "zmm"}[level]
+        width = {SIMDLevel.SSE: 16, SIMDLevel.AVX: 32,
+                 SIMDLevel.AVX512: 64}[level]
+        op = {"+": "add", "-": "sub", "*": "mul", "/": "div"}[node.value]
+        self.gen_expression(node.children[0])
+        self.gen_expression(node.children[1])
+        for offset in range(0, size, width):
+            if level == SIMDLevel.SSE:
+                self.emit(f"movups {reg}0, [rsp + {size + offset}]", "text")
+                self.emit(f"movups {reg}1, [rsp + {offset}]", "text")
+                self.emit(f"{op}{suffix} {reg}0, {reg}1", "text")
+                self.emit(f"movups [rsp + {size + offset}], {reg}0", "text")
+            else:
+                self.emit(f"vmovups {reg}0, [rsp + {size + offset}]", "text")
+                self.emit(f"v{op}{suffix} {reg}0, {reg}0, [rsp + {offset}]", "text")
+                self.emit(f"vmovups [rsp + {size + offset}], {reg}0", "text")
+        self.emit(f"add rsp, {size}", "text")
+
+    def gen_scalar_double(self, node: ASTNode, register: str = "xmm0") -> None:
+        self.gen_expression(node)
+        self.emit("pop rax", "text")
+        if self.is_float_node(node):
+            self.emit(f"movq {register}, rax", "text")
+        elif self.is_unsigned_node(node):
+            self.emit("mov rdx, rax", "text")
+            self.emit("shr rdx, 1", "text")
+            self.emit("and eax, 1", "text")
+            self.emit("or rdx, rax", "text")
+            self.emit(f"cvtsi2sd {register}, rdx", "text")
+            self.emit(f"addsd {register}, {register}", "text")
+        else:
+            self.emit(f"cvtsi2sd {register}, rax", "text")
+
+    def gen_option_method(self, node: ASTNode) -> None:
+        receiver = node.children[0]
+        args = node.children[1:]
+        if receiver.meta.get('is_type_name') and receiver.value == 'Option':
+            if node.value == 'some' and len(args) == 1:
+                self.emit("sub rsp, 16", "text")
+                self.emit("mov qword [rsp], 1", "text")
+                self.gen_expression(args[0])
+                self.emit("pop rax", "text")
+                self.emit("mov qword [rsp + 8], rax", "text")
+                return
+            if node.value == 'none' and not args:
+                self.emit("sub rsp, 16", "text")
+                self.emit("mov qword [rsp], 0", "text")
+                self.emit("mov qword [rsp + 8], 0", "text")
+                return
+        recv_ref = self.ref_of(receiver)
+        if isinstance(recv_ref, TypeRef) and recv_ref.base == DataType.OPTION:
+            self.gen_address(receiver)
+            if node.value in ('is_some', 'is_none'):
+                self.emit("cmp qword [rax], 0", "text")
+                self.emit("setne al" if node.value == 'is_some' else "sete al", "text")
+                self.emit("movzx eax, al", "text")
+                self.emit("push rax", "text")
+                return
+            if node.value == 'unwrap':
+                valid = self.new_label()
+                self.emit("cmp qword [rax], 0", "text")
+                self.emit(f"jne {valid}", "text")
+                self.emit("ud2", "text")
+                self.emit_raw(f"{valid}:", "text")
+                self.emit("mov rax, qword [rax + 8]", "text")
+                self.emit("push rax", "text")
+                return
+        self.emit(f"; unsupported Option method {node.value}", "text")
+        self.emit("push 0", "text")
+
+    def gen_vector_method(self, node: ASTNode, ref: TypeRef) -> None:
+        receiver = node.children[0]
+        args = node.children[1:]
+        lanes, lane_size, level = VECTOR_INFO[ref.base]
+        size = lanes * lane_size
+        suffix = "ps" if lane_size == 4 else "pd"
+        scalar_op = "ss" if lane_size == 4 else "sd"
+        reg = {SIMDLevel.SSE: "xmm", SIMDLevel.AVX: "ymm",
+               SIMDLevel.AVX512: "zmm"}[level]
+        width = {SIMDLevel.SSE: 16, SIMDLevel.AVX: 32,
+                 SIMDLevel.AVX512: 64}[level]
+
+        if node.value == "iota" and len(args) == 2:
+            self.emit(f"sub rsp, {size + 16}", "text")
+            self.gen_scalar_double(args[0])
+            self.emit("movq rax, xmm0", "text")
+            self.emit("mov qword [rsp], rax", "text")
+            self.gen_scalar_double(args[1])
+            self.emit("movq rax, xmm0", "text")
+            self.emit("mov qword [rsp + 8], rax", "text")
+            self.emit("movq xmm0, qword [rsp]", "text")
+            for lane in range(lanes):
+                offset = 16 + lane * lane_size
+                if lane_size == 4:
+                    self.emit("cvtsd2ss xmm1, xmm0", "text")
+                    self.emit("movd eax, xmm1", "text")
+                    self.emit(f"mov dword [rsp + {offset}], eax", "text")
                 else:
-                    self.emit(f"vextractf128 xmm1, {'ymm' if level == SIMDLevel.AVX else 'zmm'}0, 1", "text")
-                    self.emit("addps xmm0, xmm1", "text")
-                    self.emit("haddps xmm0, xmm0", "text")
-                    self.emit("haddps xmm0, xmm0", "text")
-            elif op == "load":
-                self.emit("movaps xmm0, [rax]", "text")
-            elif op == "store":
-                self.emit("movaps [rax], xmm0", "text")
-            elif op == "sqrt":
-                self.emit("sqrtps xmm0, xmm0", "text")
-            elif op == "rcp":
-                self.emit("rcpps xmm0, xmm0", "text")
-            elif op == "rsqrt":
-                self.emit("rsqrtps xmm0, xmm0", "text")
-                
+                    self.emit(f"movq qword [rsp + {offset}], xmm0", "text")
+                if lane + 1 < lanes:
+                    self.emit("movq xmm1, qword [rsp + 8]", "text")
+                    self.emit("addsd xmm0, xmm1", "text")
+            self.emit("add rsp, 16", "text")
+            return
+
+        if node.value == "broadcast" and len(args) == 1:
+            self.emit(f"sub rsp, {size + 8}", "text")
+            self.gen_scalar_double(args[0])
+            self.emit("movq rax, xmm0", "text")
+            self.emit("mov qword [rsp], rax", "text")
+            for lane in range(lanes):
+                offset = 8 + lane * lane_size
+                self.emit("movq xmm0, qword [rsp]", "text")
+                if lane_size == 4:
+                    self.emit("cvtsd2ss xmm0, xmm0", "text")
+                    self.emit("movd eax, xmm0", "text")
+                    self.emit(f"mov dword [rsp + {offset}], eax", "text")
+                else:
+                    self.emit(f"movq qword [rsp + {offset}], xmm0", "text")
+            self.emit("add rsp, 8", "text")
+            return
+
+        if node.value == "fma" and len(args) == 2:
+            self.gen_address(receiver)
             self.emit("push rax", "text")
+            self.gen_expression(args[0])
+            self.gen_expression(args[1])
+            self.emit("pop rdx", "text")
+            self.emit("pop rsi", "text")
+            self.emit("pop rdi", "text")
+            self.emit(f"sub rsp, {size}", "text")
+            for offset in range(0, size, width):
+                if level == SIMDLevel.SSE:
+                    self.emit(f"movups {reg}0, [rdi + {offset}]", "text")
+                    self.emit(f"mul{suffix} {reg}0, [rsi + {offset}]", "text")
+                    self.emit(f"add{suffix} {reg}0, [rdx + {offset}]", "text")
+                    self.emit(f"movups [rsp + {offset}], {reg}0", "text")
+                else:
+                    self.emit(f"vmovups {reg}0, [rdi + {offset}]", "text")
+                    self.emit(f"vmul{suffix} {reg}0, {reg}0, [rsi + {offset}]", "text")
+                    self.emit(f"vadd{suffix} {reg}0, {reg}0, [rdx + {offset}]", "text")
+                    self.emit(f"vmovups [rsp + {offset}], {reg}0", "text")
+            return
+
+        if node.value in ("dot", "hadd_all", "hmax", "hmin") \
+                and (node.value != "dot" or len(args) == 1):
+            self.gen_address(receiver)
+            self.emit("push rax", "text")
+            if node.value == "dot":
+                self.gen_expression(args[0])
+                self.emit("pop rsi", "text")
+            else:
+                self.emit("xorps xmm0, xmm0", "text")
+            self.emit("pop rdi", "text")
+            if node.value in ("hmax", "hmin"):
+                self.emit(f"mov{scalar_op} xmm0, [{ 'rdi' }]", "text")
+                first_lane = 1
+            else:
+                first_lane = 0
+            for lane in range(first_lane, lanes):
+                offset = lane * lane_size
+                self.emit(f"mov{scalar_op} xmm1, [rdi + {offset}]", "text")
+                if node.value == "dot":
+                    self.emit(f"mov{scalar_op} xmm2, [rsi + {offset}]", "text")
+                    self.emit(f"mul{scalar_op} xmm1, xmm2", "text")
+                    self.emit(f"add{scalar_op} xmm0, xmm1", "text")
+                elif node.value == "hadd_all":
+                    self.emit(f"add{scalar_op} xmm0, xmm1", "text")
+                else:
+                    replace = self.new_label()
+                    done = self.new_label()
+                    self.emit(f"ucomi{scalar_op} xmm0, xmm1", "text")
+                    self.emit(f"j{'b' if node.value == 'hmax' else 'a'} {replace}", "text")
+                    self.emit(f"jmp {done}", "text")
+                    self.emit_raw(f"{replace}:", "text")
+                    self.emit(f"mov{scalar_op} xmm0, xmm1", "text")
+                    self.emit_raw(f"{done}:", "text")
+            if lane_size == 4:
+                self.emit("cvtss2sd xmm0, xmm0", "text")
+            self.emit("movq rax, xmm0", "text")
+            self.emit("push rax", "text")
+            return
+
+        self.emit(f"; unsupported SIMD method {node.value}", "text")
+        self.emit("push 0", "text")
                     
     def gen_builtin(self, node: ASTNode) -> None:
         name = node.value
@@ -3875,25 +4256,48 @@ class CodeGenerator:
             return ref
         if node.type == ASTType.LITERAL:
             return TypeRef(base=node.data_type)
+        if node.type == ASTType.BINARY_OP and node.data_type in VECTOR_INFO:
+            return TypeRef(base=node.data_type, name=node.data_type.name.lower())
         # member chains (a.b.c) and indexed members resolve through their base type
         if node.type == ASTType.MEMBER_ACCESS and node.children:
             base = self.ref_of(node.children[0])
             if isinstance(base, TypeRef) and self.symbols.struct_name_of(base):
                 found = self.symbols.field_ref(self.symbols.struct_name_of(base), node.value)
                 if found is not None:
-                    return found
+                    return self.symbols.specialize_class_ref(base, found)
         if node.type == ASTType.INDEX and node.children:
             base = self.ref_of(node.children[0])
             if isinstance(base, TypeRef) and base.elem is not None:
                 return base.elem
         if node.type == ASTType.METHOD_CALL and node.children:
             recv = node.children[0]
+            recv_ref = self.ref_of(recv)
+            if recv.meta.get('is_type_name') and recv.value == 'Option':
+                if node.value == 'some' and len(node.children) > 1:
+                    return TypeRef(base=DataType.OPTION, name='Option',
+                                   elem=self.ref_of(node.children[1]) or TypeRef(base=DataType.U64))
+                if node.value == 'none':
+                    return TypeRef(base=DataType.OPTION, name='Option',
+                                   elem=TypeRef(base=DataType.U64))
+            if isinstance(recv_ref, TypeRef) and recv_ref.base == DataType.OPTION:
+                if node.value == 'unwrap':
+                    return recv_ref.elem or TypeRef(base=DataType.U64)
+                if node.value in ('is_some', 'is_none'):
+                    return TypeRef(base=DataType.BOOL)
+            if isinstance(recv_ref, TypeRef) and recv_ref.base in VECTOR_INFO:
+                if node.value in ('iota', 'broadcast', 'fma'):
+                    return recv_ref
+                if node.value in ('dot', 'hadd_all', 'hmax', 'hmin'):
+                    return TypeRef(base=DataType.F64)
             owner = recv.value if recv.meta.get('is_type_name') else \
-                self.symbols.struct_name_of(self.ref_of(recv))
+                self.symbols.struct_name_of(recv_ref)
             fn = self.symbols.find_method(owner, node.value) if owner else None
             if fn is not None and isinstance(fn.meta.get('return_ref'), TypeRef):
-                return fn.meta['return_ref']
+                return self.symbols.specialize_class_ref(recv_ref, fn.meta['return_ref'])
         if node.type == ASTType.CALL:
+            ret = node.meta.get('return_ref')
+            if isinstance(ret, TypeRef):
+                return ret
             cands = self.symbols.find_functions(node.value)
             if cands and isinstance(cands[0].meta.get('return_ref'), TypeRef):
                 return cands[0].meta['return_ref']
@@ -3902,6 +4306,9 @@ class CodeGenerator:
     def size_of(self, ref) -> int:
         return type_size(ref, self.symbols)
 
+    def option_size(self, ref) -> int:
+        return (self.size_of(ref) + 7) & ~7
+
     @staticmethod
     def reg_for(prefix: str) -> str:
         return {'byte': 'al', 'word': 'ax', 'dword': 'eax', 'qword': 'rax'}.get(prefix, 'rax')
@@ -3909,6 +4316,13 @@ class CodeGenerator:
     @staticmethod
     def is_pointer(ref) -> bool:
         return isinstance(ref, TypeRef) and (ref.base in POINTER_TYPES or ref.is_ref)
+
+    def is_aggregate_ref(self, ref) -> bool:
+        if not isinstance(ref, TypeRef) or self.is_pointer(ref):
+            return False
+        if ref.base == DataType.ARRAY:
+            return True
+        return ref.base == DataType.STRUCT and self.symbols.struct_layout(ref.name) is not None
 
     def mov_prefix_of(self, ref) -> str:
         if self.is_pointer(ref):
@@ -3973,6 +4387,10 @@ class CodeGenerator:
         if node is None:
             return False
         if node.data_type in (DataType.F32, DataType.F64):
+            return True
+        if node.type == ASTType.UNARY_OP and node.children:
+            return self.is_float_node(node.children[0])
+        if node.type == ASTType.BINARY_OP and node.data_type in FLOAT_TYPES:
             return True
         return self.is_float_ref(self.ref_of(node))
 
@@ -4180,6 +4598,8 @@ class CodeGenerator:
 
     # -- calls -------------------------------------------------------------
     def resolve_callee(self, node: ASTNode) -> str:
+        if node.meta.get('resolved_label'):
+            return node.meta['resolved_label']
         name = node.value
         candidates = self.symbols.find_functions(name)
         if not candidates:
@@ -4283,6 +4703,15 @@ class CodeGenerator:
             receiver = node.children[0] if node.children else None
             args = node.children[1:]
             recv_ref = self.ref_of(receiver) if receiver is not None else None
+            if receiver is not None and (receiver.meta.get('is_type_name')
+                                         and receiver.value == 'Option'
+                                         or isinstance(recv_ref, TypeRef)
+                                         and recv_ref.base == DataType.OPTION):
+                self.gen_option_method(node)
+                return
+            if isinstance(recv_ref, TypeRef) and recv_ref.base in VECTOR_INFO:
+                self.gen_vector_method(node, recv_ref)
+                return
             owner = self.symbols.struct_name_of(recv_ref)
             method = node.value
             fn_ctx = getattr(self, 'current_function_node', None)
@@ -4377,7 +4806,14 @@ class CodeGenerator:
                 self.emit(f"call qword [rax + {8 * slot}]", "text")
             else:
                 self.emit(f"call {target}", "text")
-            self.emit("push rax", "text")
+            result_ref = self.ref_of(node)
+            if isinstance(result_ref, TypeRef) and result_ref.base == DataType.OPTION:
+                size = self.option_size(result_ref)
+                self.emit(f"sub rsp, {size}", "text")
+                self.emit("mov qword [rsp], rax", "text")
+                self.emit("mov qword [rsp + 8], rdx", "text")
+            else:
+                self.emit("push rax", "text")
             return
 
         args = node.children[1:] if len(node.children) > 1 else []
@@ -4464,6 +4900,8 @@ class CodeGenerator:
             esize = 8
             if isinstance(elem, TypeRef) and elem.elem is not None:
                 esize = self.size_of(elem.elem)
+            elif isinstance(elem, TypeRef) and elem.base in VECTOR_INFO:
+                esize = VECTOR_INFO[elem.base][1]
             if esize != 1:
                 self.emit(f"imul rbx, {esize}", "text")
             self.emit("add rax, rbx", "text")
@@ -4553,6 +4991,26 @@ class CodeGenerator:
         # array declaration with an initialiser
         if value is not None and value.type == ASTType.ARRAY_LITERAL:
             self.gen_array_init(lhs, value)
+            return
+
+        if isinstance(ref, TypeRef) and ref.base in VECTOR_INFO:
+            size = self.size_of(ref)
+            if value is None:
+                self.gen_address(lhs)
+                self.emit("mov rbx, rax", "text")
+                self.emit("pxor xmm0, xmm0", "text")
+                for offset in range(0, size, 16):
+                    self.emit(f"movups [rbx + {offset}], xmm0", "text")
+            else:
+                self.gen_expression(value)
+                self.emit("push rsp", "text")
+                self.gen_address(lhs)
+                self.emit("mov rbx, rax", "text")
+                self.emit("pop r10", "text")
+                for offset in range(0, size, 16):
+                    self.emit(f"movups xmm0, [r10 + {offset}]", "text")
+                    self.emit(f"movups [rbx + {offset}], xmm0", "text")
+                self.emit(f"add rsp, {size}", "text")
             return
 
         # struct literal
@@ -4662,7 +5120,17 @@ class CodeGenerator:
 
     def gen_return(self, node: ASTNode) -> None:
         fn = getattr(self, 'current_function_node', None)
-        if node.children and node.children[0].type == ASTType.STRUCT_LITERAL and fn is not None \
+        return_ref = fn.meta.get('return_ref') if fn is not None else None
+        if isinstance(return_ref, TypeRef) and return_ref.base == DataType.OPTION:
+            if node.children:
+                self.gen_expression(node.children[0])
+                self.emit("mov rax, qword [rsp]", "text")
+                self.emit("mov rdx, qword [rsp + 8]", "text")
+                self.emit(f"add rsp, {self.option_size(return_ref)}", "text")
+            else:
+                self.emit("xor eax, eax", "text")
+                self.emit("xor edx, edx", "text")
+        elif node.children and node.children[0].type == ASTType.STRUCT_LITERAL and fn is not None \
                 and (fn.function_param_names or [None])[0] == 'self' and fn.meta.get('param_offsets'):
             # constructor: build the literal directly in the object `this` points at
             this_off = fn.meta['param_offsets'][0]
@@ -4898,8 +5366,25 @@ class CodeGenerator:
                 self.emit(f"lea rax, [rel {label}]", "text")
                 self.emit("push rax", "text")
                 return
-            if ref is not None and ref.base in (DataType.ARRAY, DataType.STRUCT) \
-                    and not self.is_pointer(ref):
+            if isinstance(ref, TypeRef) and ref.base == DataType.OPTION:
+                size = self.option_size(ref)
+                self.emit(f"sub rsp, {size}", "text")
+                self.gen_address(node)
+                self.emit("mov r11, rax", "text")
+                for offset in range(0, size, 8):
+                    self.emit(f"mov rax, qword [r11 + {offset}]", "text")
+                    self.emit(f"mov qword [rsp + {offset}], rax", "text")
+                return
+            if isinstance(ref, TypeRef) and ref.base in VECTOR_INFO:
+                size = self.size_of(ref)
+                self.emit(f"sub rsp, {size}", "text")
+                self.gen_address(node)
+                self.emit("mov r11, rax", "text")
+                for offset in range(0, size, 16):
+                    self.emit(f"movups xmm0, [r11 + {offset}]", "text")
+                    self.emit(f"movups [rsp + {offset}], xmm0", "text")
+                return
+            if self.is_aggregate_ref(ref):
                 self.gen_address(node)
                 self.emit("push rax", "text")
                 return
@@ -4921,8 +5406,7 @@ class CodeGenerator:
 
         if t == ASTType.INDEX:
             ref = self.ref_of(node)
-            if ref is not None and ref.base in (DataType.ARRAY, DataType.STRUCT) \
-                    and not self.is_pointer(ref):
+            if self.is_aggregate_ref(ref):
                 self.gen_address(node)
                 self.emit("push rax", "text")
                 return
@@ -4941,8 +5425,7 @@ class CodeGenerator:
                 base_ref = self.ref_of(node.children[0]) if node.children else None
                 struct_name = self.symbols.struct_name_of(base_ref)
                 ref = self.symbols.field_ref(struct_name, node.value)
-            if ref is not None and ref.base in (DataType.ARRAY, DataType.STRUCT) \
-                    and not self.is_pointer(ref):
+            if self.is_aggregate_ref(ref):
                 self.gen_address(node)
                 self.emit("push rax", "text")
                 return
@@ -4996,8 +5479,7 @@ class CodeGenerator:
             return
 
         if t == ASTType.SIMD_OPERATION:
-            self.emit(f"; SIMD operation '{node.value}' is not yet implemented", "text")
-            self.emit("push 0", "text")
+            self.gen_simd_operation(node)
             return
 
         if t == ASTType.BLOCK_ARRAY_METHOD:
@@ -5063,6 +5545,11 @@ class CodeGenerator:
     def gen_binary(self, node: ASTNode) -> None:
         op = node.value
         left, right = node.children[0], node.children[1]
+        left_ref, right_ref = self.ref_of(left), self.ref_of(right)
+        if isinstance(left_ref, TypeRef) and left_ref.base in VECTOR_INFO \
+                and isinstance(right_ref, TypeRef) and right_ref.base == left_ref.base:
+            self.gen_vector_binary(node, left_ref)
+            return
         left_float = self.is_float_node(left)
         right_float = self.is_float_node(right)
         use_float = left_float or right_float
@@ -5119,8 +5606,28 @@ class CodeGenerator:
         unsigned = (not signed) and (self.is_unsigned_node(left) or self.is_unsigned_node(right))
 
         if use_float:
-            self.emit("movq xmm0, rax", "text")
-            self.emit("movq xmm1, rbx", "text")
+            if left_float:
+                self.emit("movq xmm0, rax", "text")
+            elif self.is_unsigned_node(left):
+                self.emit("mov rdx, rax", "text")
+                self.emit("shr rdx, 1", "text")
+                self.emit("and eax, 1", "text")
+                self.emit("or rdx, rax", "text")
+                self.emit("cvtsi2sd xmm0, rdx", "text")
+                self.emit("addsd xmm0, xmm0", "text")
+            else:
+                self.emit("cvtsi2sd xmm0, rax", "text")
+            if right_float:
+                self.emit("movq xmm1, rbx", "text")
+            elif self.is_unsigned_node(right):
+                self.emit("mov rdx, rbx", "text")
+                self.emit("shr rdx, 1", "text")
+                self.emit("and ebx, 1", "text")
+                self.emit("or rdx, rbx", "text")
+                self.emit("cvtsi2sd xmm1, rdx", "text")
+                self.emit("addsd xmm1, xmm1", "text")
+            else:
+                self.emit("cvtsi2sd xmm1, rbx", "text")
             if op == '+':
                 self.emit("addsd xmm0, xmm1", "text")
             elif op == '-':
@@ -5131,13 +5638,46 @@ class CodeGenerator:
                 self.emit("divsd xmm0, xmm1", "text")
             elif op in ('==', '!=', '<', '<=', '>', '>='):
                 self.emit("ucomisd xmm0, xmm1", "text")
-                self.emit({"==": "sete al", "!=": "setne al", "<": "setb al",
-                           "<=": "setbe al", ">": "seta al", ">=": "setae al"}[op], "text")
+                if op in ("==", "!="):
+                    self.emit("sete al" if op == "==" else "setne al", "text")
+                    self.emit("setnp dl" if op == "==" else "setp dl", "text")
+                    self.emit("and al, dl" if op == "==" else "or al, dl", "text")
+                elif op in ("<", "<="):
+                    self.emit("setb al" if op == "<" else "setbe al", "text")
+                    self.emit("setnp dl", "text")
+                    self.emit("and al, dl", "text")
+                else:
+                    self.emit("seta al" if op == ">" else "setae al", "text")
                 self.emit("movzx eax, al", "text")
                 self.emit("push rax", "text")
                 return
             elif op == '**':
-                self.emit("; '**' on floats is not yet implemented", "text")
+                exponent = self.const_eval(right)
+                if exponent == 0.5:
+                    self.emit("sqrtsd xmm0, xmm0", "text")
+                elif exponent == -0.5:
+                    self.emit("sqrtsd xmm0, xmm0", "text")
+                    self.emit("mov rax, 0x3ff0000000000000", "text")
+                    self.emit("movq xmm1, rax", "text")
+                    self.emit("divsd xmm1, xmm0", "text")
+                    self.emit("movapd xmm0, xmm1", "text")
+                elif isinstance(exponent, (int, float)) and float(exponent).is_integer() \
+                        and abs(int(exponent)) <= 32:
+                    power = abs(int(exponent))
+                    if power == 0:
+                        self.emit("mov rax, 0x3ff0000000000000", "text")
+                        self.emit("movq xmm0, rax", "text")
+                    else:
+                        self.emit("movapd xmm1, xmm0", "text")
+                        for _ in range(power - 1):
+                            self.emit("mulsd xmm0, xmm1", "text")
+                        if exponent < 0:
+                            self.emit("mov rax, 0x3ff0000000000000", "text")
+                            self.emit("movq xmm1, rax", "text")
+                            self.emit("divsd xmm1, xmm0", "text")
+                            self.emit("movapd xmm0, xmm1", "text")
+                else:
+                    self.emit("; floating exponent must be a constant integer or +/-0.5", "text")
             self.emit("movq rax, xmm0", "text")
             self.emit("push rax", "text")
             return
@@ -5147,7 +5687,23 @@ class CodeGenerator:
         elif op == '-':
             self.emit("sub rax, rbx", "text")
         elif op == '*':
-            self.emit("imul rax, rbx", "text")
+            factor = self.const_eval(right)
+            other = left
+            value = factor
+            if factor is None:
+                value = self.const_eval(left)
+                other = right
+            if self.opt_level.value >= OptimizationLevel.O2.value \
+                    and isinstance(value, int) and value > 0 and value & (value - 1) == 0 \
+                    and (self.is_unsigned_node(other) or self.is_signed_node(other)):
+                shift = value.bit_length() - 1
+                if other is right:
+                    self.emit(f"shl rbx, {shift}", "text")
+                    self.emit("mov rax, rbx", "text")
+                else:
+                    self.emit(f"shl rax, {shift}", "text")
+            else:
+                self.emit("imul rax, rbx", "text")
         elif op == '/':
             if signed:
                 self.emit("cqo", "text")
@@ -5958,6 +6514,165 @@ class Compiler:
         self.config = LanguageConfig()
         self.errors = ErrorCollector()
         self.symbols = SymbolTable()
+
+    def _specialize_function_templates(self, program: ASTNode) -> ASTNode:
+        codegen = CodeGenerator(self.backend, self.symbols, self.opt_level, self.output_format)
+
+        def walk(node):
+            yield node
+            for child in node.children:
+                yield from walk(child)
+
+        def actual_ref(node):
+            if node.type == ASTType.LITERAL and node.meta.get('is_string'):
+                return TypeRef(base=DataType.STRING, name="string")
+            return codegen.ref_of(node) or TypeRef(base=node.data_type)
+
+        def same_type(left, right):
+            if left.base != right.base:
+                return False
+            if left.base == DataType.STRUCT and left.name != right.name:
+                return False
+            if left.elem is not None or right.elem is not None:
+                return left.elem is not None and right.elem is not None \
+                    and same_type(left.elem, right.elem)
+            return len(left.params) == len(right.params) and all(
+                same_type(a, b) for a, b in zip(left.params, right.params))
+
+        def bind(param, actual, params, bindings):
+            if param.base == DataType.STRUCT and param.name in params:
+                previous = bindings.get(param.name)
+                if previous is not None:
+                    return same_type(previous, actual)
+                bindings[param.name] = copy.deepcopy(actual)
+                return True
+            if param.base != actual.base:
+                return False
+            if param.base == DataType.STRUCT and param.name and param.name != actual.name:
+                return False
+            if param.elem is not None:
+                return actual.elem is not None and bind(param.elem, actual.elem, params, bindings)
+            return True
+
+        def substitute_ref(ref, bindings):
+            if not isinstance(ref, TypeRef):
+                return ref
+            if ref.base == DataType.STRUCT and ref.name in bindings:
+                return copy.deepcopy(bindings[ref.name])
+            result = copy.deepcopy(ref)
+            result.elem = substitute_ref(result.elem, bindings) if result.elem else None
+            result.params = [substitute_ref(p, bindings) for p in result.params]
+            result.fn_params = [substitute_ref(p, bindings) for p in result.fn_params]
+            if result.fn_return is not None:
+                result.fn_return = substitute_ref(result.fn_return, bindings)
+            return result
+
+        def substitute_value(value, bindings):
+            if isinstance(value, TypeRef):
+                return substitute_ref(value, bindings)
+            if isinstance(value, list):
+                return [substitute_value(item, bindings) for item in value]
+            if isinstance(value, tuple):
+                return tuple(substitute_value(item, bindings) for item in value)
+            if isinstance(value, dict):
+                return {key: substitute_value(item, bindings) for key, item in value.items()}
+            if isinstance(value, ASTNode):
+                substitute_node(value, bindings)
+            return value
+
+        def substitute_node(node, bindings):
+            node.meta = {key: substitute_value(value, bindings)
+                         for key, value in node.meta.items()}
+            if node.type == ASTType.BINARY_OP and node.children:
+                ref = node.children[0].meta.get('type_ref')
+                if isinstance(ref, TypeRef):
+                    node.data_type = ref.base
+            for child in node.children:
+                substitute_node(child, bindings)
+            if node.type == ASTType.FUNCTION:
+                node.meta['param_refs'] = [
+                    substitute_ref(p, bindings) for p in node.meta.get('param_refs', [])]
+                node.meta['return_ref'] = substitute_ref(node.meta.get('return_ref'), bindings)
+                node.function_params = [p.base for p in node.meta['param_refs']]
+                node.function_return = node.meta['return_ref'].base
+
+        candidates_by_name = {}
+        for fn in self.symbols.functions:
+            candidates_by_name.setdefault(fn.value, []).append(fn)
+        specialized = {}
+        generated = []
+
+        for call in list(walk(program)):
+            if call.type != ASTType.CALL:
+                continue
+            args = call.children[1:]
+            arg_refs = [actual_ref(arg) for arg in args]
+            candidates = candidates_by_name.get(call.value, [])
+
+            fixed = []
+            generic = []
+            for candidate in candidates:
+                refs = candidate.meta.get('param_refs') or []
+                if len(refs) != len(arg_refs):
+                    continue
+                if candidate.template_params:
+                    generic.append(candidate)
+                elif all(same_type(pref, actual) for pref, actual in zip(refs, arg_refs)):
+                    fixed.append(candidate)
+
+            if fixed:
+                chosen = fixed[0]
+                call.meta['resolved_label'] = chosen.meta.get('label') or codegen.function_label(chosen)
+                call.meta['return_ref'] = copy.deepcopy(chosen.meta.get('return_ref'))
+                continue
+
+            for template in generic:
+                bindings = {}
+                params = set(template.template_params)
+                refs = template.meta.get('param_refs') or []
+                if not all(bind(pref, actual, params, bindings)
+                           for pref, actual in zip(refs, arg_refs)):
+                    continue
+                if any(param not in bindings for param in params):
+                    continue
+                key = (template.value, tuple((name, repr(bindings[name]))
+                                             for name in template.template_params))
+                clone = specialized.get(key)
+                if clone is None:
+                    clone = copy.deepcopy(template)
+                    substitute_node(clone, bindings)
+                    clone.template_params = []
+                    tags = "_".join(codegen._type_tag(bindings[name])
+                                    for name in template.template_params)
+                    clone.meta['label'] = f"{template.value}__{tags}"
+                    clone.meta['template_instance'] = True
+                    specialized[key] = clone
+                    generated.append(clone)
+                    self.symbols.register_function(clone.value, clone)
+                    candidates_by_name.setdefault(clone.value, []).append(clone)
+                call.meta['resolved_label'] = clone.meta['label']
+                call.meta['return_ref'] = copy.deepcopy(clone.meta.get('return_ref'))
+                break
+
+        for fn in [node for node in walk(program) if node.type == ASTType.FUNCTION] + generated:
+            inferred = {}
+            for node in walk(fn):
+                if node.type == ASTType.ASSIGN and node.children:
+                    value = node.children[-1]
+                    result = value.meta.get('return_ref')
+                    lhs = node.children[0]
+                    if isinstance(result, TypeRef) and lhs.type == ASTType.VARIABLE:
+                        node.meta['type_ref'] = copy.deepcopy(result)
+                        lhs.meta['type_ref'] = copy.deepcopy(result)
+                    ref = node.meta.get('type_ref')
+                    if isinstance(ref, TypeRef) and lhs.type == ASTType.VARIABLE:
+                        inferred[lhs.value] = ref
+            for node in walk(fn):
+                if node.type == ASTType.VARIABLE and node.value in inferred:
+                    node.meta['type_ref'] = copy.deepcopy(inferred[node.value])
+
+        program.children.extend(generated)
+        return program
         
     def compile(self, source: str, output_file: str, source_file: str = "<input>") -> bool:
         if self.verbose:
@@ -5996,6 +6711,8 @@ class Compiler:
         if self.errors.has_errors():
             self.errors.print_summary()
             return False
+
+        ast = self._specialize_function_templates(ast)
             
         if self.verbose:
             print("Parser: AST built")

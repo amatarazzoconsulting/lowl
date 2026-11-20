@@ -19,14 +19,17 @@ SYMBOLISH = re.compile(r'(?<![A-Za-z0-9_$@.])([A-Za-z_.$@][\w.$@]*)')
 REGISTERS = set('''rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15
 eax ebx ecx edx esi edi ebp esp r8d r9d r10d r11d
 ax bx cx dx si di bp sp al bl cl dl ah bh ch dh
-xmm0 xmm1 xmm2 xmm3 xmm4 xmm5 xmm6 xmm7 xmm8 xmm9 xmm10 xmm11 xmm12 xmm13 xmm14 xmm15 ymm0 ymm1 ymm2 ymm3 zmm0 zmm1 zmm2 zmm3
 cl cs ds es ss byte word dword qword ptr xmmword ymmword zmmword'''.split())
+REGISTERS.update(f"{kind}{index}" for kind in ("xmm", "ymm", "zmm") for index in range(32))
 
 MNEMONICS = set('''mov movzx movsx lea add sub imul mul idiv div and or xor not neg inc dec
 cmp test jmp je jne jz jnz jg jge jl jle ja jae jb jbe jns js call ret push pop
-sete setne setl setle setg setge seta setae setb setbe shl shr sar sal syscall
-int iretq pushfq popfq nop cdq cqo mfence lfence sfence xchg
-movq movd movsd addsd subsd mulsd divsd sqrtsd ucomisd comisd cvtsi2sd cvttsd2si
+sete setne setl setle setg setge seta setae setb setbe setp setnp shl shr sar sal syscall
+int iretq pushfq popfq nop cdq cqo movsxd ud2 mfence lfence sfence xchg
+movq movd movsd movapd addsd subsd mulsd divsd sqrtsd ucomisd comisd cvtsi2sd cvttsd2si
+movss movups vmovups cvtsd2ss cvtss2sd ucomiss addss subss mulss divss
+addps subps mulps divps addpd subpd mulpd divpd
+vaddps vsubps vmulps vdivps vaddpd vsubpd vmulpd vdivpd
 pxor xorps andps orps
 rep repe repne cld std stosb stosd stosq movsb movsd_ movsq lodsb in out'''.split())
 
